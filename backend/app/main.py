@@ -4,10 +4,12 @@ from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi import HTTPException
 
 from backend.app.services.audio_service import audio_service
 from backend.app.services.model_service import model_service
 from backend.app.services.voice_service import voice_service
+from backend.app.schemas.voice import VoiceCloneResponse
 from backend.app.utils.paths import initialize_directories
 
 
@@ -86,29 +88,52 @@ async def upload_audio(file: UploadFile = File(...)):
             "content": {
                 "audio/wav": {}
             },
-        }
+        },
+        400: {
+            "description": "Invalid audio or text"
+        },
+        500: {
+            "description": "Voice generation failed"
+        },
     },
 )
 async def clone_voice(
     reference_audio: UploadFile = File(...),
     text: str = Form(...),
 ):
+    if not text or not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty"
+        )
+
+    if not reference_audio.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Reference audio file is required"
+        )
+
     uploaded = await audio_service.process_upload(reference_audio)
 
     result = voice_service.generate_voice(
         reference_file=uploaded["processed_file"],
-        text=text,
+        text=text.strip(),
     )
 
     output_file = Path(result["output_file"])
 
     if not output_file.exists():
-        raise RuntimeError(
-            "Voice generation completed but output file was not found"
+        raise HTTPException(
+            status_code=500,
+            detail="Voice generation completed but output file was not found"
         )
 
     return FileResponse(
         path=str(output_file),
         media_type="audio/wav",
         filename=output_file.name,
+        headers={
+            "X-Voice-Clone-Sample-Rate": str(result["sample_rate"]),
+            "X-Voice-Clone-Text-Length": str(len(text.strip())),
+        },
     )
