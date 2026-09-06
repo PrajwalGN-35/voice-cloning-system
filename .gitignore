@@ -10,3 +10,17 @@ models/*
 
 reference.m4a
 test_conversion.wav
+
+# Local security/test runtime output
+security_audit.log
+test_audio.wav
+*.log
+
+# Local audio conversion files
+*.m4a
+*.flac
+*.mp3
+*.wav
+
+# Keep committed integration-test fixture
+!tests/fixtures/fake_voice.flac

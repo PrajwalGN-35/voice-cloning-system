@@ -11,6 +11,8 @@ from fastapi import HTTPException
 from backend.app.services.audio_service import audio_service
 from backend.app.services.model_service import model_service
 from backend.app.services.voice_service import voice_service
+from backend.app.services.deepfake_service import get_deepfake_service
+from backend.app.security.security_service import process_voice_security
 from backend.app.schemas.voice import VoiceCloneResponse
 from backend.app.utils.paths import initialize_directories
 
@@ -82,6 +84,52 @@ async def upload_audio(file: UploadFile = File(...)):
     }
 
 
+
+@app.post("/api/v1/voice/analyze")
+async def analyze_voice(file: UploadFile = File(...)):
+    """
+    Analyze uploaded audio for voice authenticity.
+
+    Pipeline:
+    Audio preprocessing → Member 5 deepfake detector → Member 4 risk engine.
+    """
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Audio file is required"
+        )
+
+    # Reuse the existing audio upload and preprocessing pipeline.
+    uploaded = await audio_service.process_upload(file)
+
+    # Run Member 5 deepfake detector.
+    detector = get_deepfake_service()
+    detection = detector.analyze(uploaded["processed_file"])
+
+    # Run Member 4 security/risk engine.
+    security = process_voice_security(
+        detection["prediction"].lower(),
+        detection["confidence"]
+    )
+
+    original_probability = detection["original_probability"]
+    fake_probability = detection["fake_probability"]
+
+    return {
+        "success": True,
+        "prediction": detection["prediction"],
+        "original_probability": original_probability,
+        "fake_probability": fake_probability,
+        "original_percentage": round(original_probability * 100, 4),
+        "fake_percentage": round(fake_probability * 100, 4),
+        "confidence": detection["confidence"],
+        "risk_level": security["risk_level"],
+        "action": security["action"],
+        "message": security["message"],
+        "verification_required": security["verification_required"],
+        "verification_method": security["verification_method"],
+    }
+
 @app.post(
     "/api/v1/voice/clone",
     response_class=FileResponse,
@@ -140,3 +188,4 @@ async def clone_voice(
             "X-Voice-Clone-Text-Length": str(len(text.strip())),
         },
     )
+
