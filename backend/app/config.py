@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     processed_dir: Path = Path("data/processed")
     generated_dir: Path = Path("data/generated")
     model_dir: Path = Path("models")
+    frontend_origins: str = "http://localhost:3000,http://localhost:5173"
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -4,6 +4,8 @@ from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+
+from backend.app.config import settings
 from fastapi import HTTPException
 
 from backend.app.services.audio_service import audio_service
@@ -31,8 +33,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
+        origin.strip()
+        for origin in settings.frontend_origins.split(",")
+        if origin.strip()
     ],
     allow_credentials=True,
     allow_methods=["*"],
