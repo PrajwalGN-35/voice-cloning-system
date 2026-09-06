@@ -7,3 +7,6 @@ data/processed/*
 data/generated/*
 models/*
 !.gitkeep
+
+reference.m4a
+test_conversion.wav
