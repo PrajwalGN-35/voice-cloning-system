@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "AI Voice Cloning System"
     app_version: str = "1.0.0"
-    debug: bool = True
+    debug: bool = False
 
     max_audio_size_mb: int = 50
     supported_audio_formats: str = "wav,mp3,m4a,flac,ogg"
@@ -18,7 +18,10 @@ class Settings(BaseSettings):
 
     frontend_origins: str = "http://localhost:3000,http://localhost:5173"
 
-    api_key: str = Field(default="", validation_alias="VOICEGUARD_API_KEY")
+    api_key: str = Field(
+        default="",
+        validation_alias="VOICEGUARD_API_KEY",
+    )
     api_auth_enabled: bool = False
 
     # Rate limiting / abuse protection
@@ -27,6 +30,7 @@ class Settings(BaseSettings):
     rate_limit_window_seconds: int = 60
     clone_rate_limit_requests: int = 5
 
+    # Production API controls
 
     model_config = SettingsConfigDict(
         env_file=".env",
