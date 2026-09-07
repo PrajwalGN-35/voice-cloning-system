@@ -2,7 +2,7 @@
 from pathlib import Path
 import logging
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -16,6 +16,7 @@ from backend.app.security.security_service import process_voice_security
 from backend.app.schemas.voice import VoiceCloneResponse
 from backend.app.utils.paths import initialize_directories
 from backend.app.errors.exceptions import AppError
+from backend.app.security import require_api_key
 from backend.app.errors.handlers import (
     app_error_handler,
     create_request_id,
@@ -161,7 +162,7 @@ async def upload_audio(file: UploadFile = File(...)):
     }
 
 
-@app.post("/api/v1/voice/analyze")
+@app.post("/api/v1/voice/analyze", dependencies=[Depends(require_api_key)])
 async def analyze_voice(file: UploadFile = File(...)):
     """
     Analyze uploaded audio for voice authenticity.
