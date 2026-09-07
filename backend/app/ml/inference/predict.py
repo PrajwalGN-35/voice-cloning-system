@@ -1,4 +1,5 @@
-import logging
+﻿import logging
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -8,31 +9,22 @@ from backend.app.ml.models.aasist import AASIST
 from backend.app.ml.preprocessing.audio_preprocessing import AudioPreprocessor
 
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class VoiceSpoofingDetector:
+    """Production inference service for the calibrated voice spoofing model."""
+
     def __init__(
         self,
         model_path: Optional[str] = None,
         device: Optional[str] = None,
-        threshold: float = 0.5,
+        threshold: Optional[float] = None,
     ):
         if device is None:
-            device = (
-                "cuda"
-                if torch.cuda.is_available()
-                else "cpu"
-            )
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.device = torch.device(device)
-        self.threshold = threshold
-
-        logger.info(
-            f"VoiceSpoofingDetector initialized "
-            f"on device: {self.device}"
-        )
 
         self.preprocessor = AudioPreprocessor(
             sample_rate=16000,
@@ -40,10 +32,21 @@ class VoiceSpoofingDetector:
             duration=5.0,
         )
 
-        # This is the same model used in train.py
         self.model = AASIST(num_classes=2)
         self.model.to(self.device)
         self.model.eval()
+
+        self.threshold = (
+            float(threshold)
+            if threshold is not None
+            else 0.5
+        )
+
+        logger.info(
+            "VoiceSpoofingDetector initialized on device=%s threshold=%s",
+            self.device,
+            self.threshold,
+        )
 
         if model_path is not None:
             self.load_model(model_path)
@@ -53,7 +56,9 @@ class VoiceSpoofingDetector:
                 "Predictions are unreliable."
             )
 
-    def load_model(self, model_path: str):
+    def load_model(self, model_path: str) -> None:
+        """Load model weights and calibrated threshold from checkpoint."""
+
         checkpoint_path = Path(model_path)
 
         if not checkpoint_path.exists():
@@ -74,11 +79,15 @@ class VoiceSpoofingDetector:
             model_state = checkpoint["model_state_dict"]
 
             if "threshold" in checkpoint:
-                self.threshold = float(
-                    checkpoint["threshold"]
-                )
+                self.threshold = float(checkpoint["threshold"])
+
         else:
             model_state = checkpoint
+
+        if not 0.0 < self.threshold < 1.0:
+            raise ValueError(
+                f"Invalid detection threshold: {self.threshold}"
+            )
 
         self.model.load_state_dict(
             model_state,
@@ -89,9 +98,39 @@ class VoiceSpoofingDetector:
         self.model.eval()
 
         logger.info(
-            f"Checkpoint loaded successfully: "
-            f"{checkpoint_path}"
+            "Checkpoint loaded successfully path=%s threshold=%s",
+            checkpoint_path,
+            self.threshold,
         )
+
+    @staticmethod
+    def _validate_probabilities(
+        probability_real: float,
+        probability_fake: float,
+    ) -> None:
+        """Validate the model probability output."""
+
+        values = (
+            probability_real,
+            probability_fake,
+        )
+
+        if not all(torch.isfinite(torch.tensor(value)) for value in values):
+            raise RuntimeError(
+                "Model produced non-finite probabilities."
+            )
+
+        if any(value < 0.0 or value > 1.0 for value in values):
+            raise RuntimeError(
+                "Model produced probabilities outside [0, 1]."
+            )
+
+        if abs(
+            (probability_real + probability_fake) - 1.0
+        ) > 1e-4:
+            raise RuntimeError(
+                "Model probabilities do not sum to 1."
+            )
 
     @torch.no_grad()
     def predict(
@@ -99,6 +138,10 @@ class VoiceSpoofingDetector:
         audio_path: str,
         return_raw: bool = False,
     ) -> Dict:
+        """Run calibrated voice spoofing inference."""
+
+        start_time = time.perf_counter()
+
         audio_file = Path(audio_path)
 
         if not audio_file.exists():
@@ -118,8 +161,6 @@ class VoiceSpoofingDetector:
             dtype=torch.float32,
         )
 
-        # Shape:
-        # (128, 501) -> (1, 1, 128, 501)
         input_tensor = (
             input_tensor
             .unsqueeze(0)
@@ -128,6 +169,11 @@ class VoiceSpoofingDetector:
         )
 
         logits = self.model(input_tensor)
+
+        if logits.ndim != 2 or logits.shape[0] != 1 or logits.shape[1] != 2:
+            raise RuntimeError(
+                f"Unexpected model output shape: {tuple(logits.shape)}"
+            )
 
         probabilities = torch.softmax(
             logits,
@@ -142,12 +188,21 @@ class VoiceSpoofingDetector:
             probabilities[1].cpu()
         )
 
+        self._validate_probabilities(
+            probability_real,
+            probability_fake,
+        )
+
         if probability_fake >= self.threshold:
             prediction = "FAKE"
             confidence = probability_fake * 100
         else:
             prediction = "REAL"
             confidence = probability_real * 100
+
+        inference_time_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
 
         result = {
             "prediction": prediction,
@@ -168,6 +223,10 @@ class VoiceSpoofingDetector:
             },
             "threshold": self.threshold,
             "audio_path": str(audio_file),
+            "inference_time_ms": round(
+                inference_time_ms,
+                2,
+            ),
         }
 
         if return_raw:
@@ -180,22 +239,38 @@ class VoiceSpoofingDetector:
                 ),
             }
 
+        logger.info(
+            "Voice inference completed prediction=%s "
+            "confidence=%.2f inference_time_ms=%.2f",
+            prediction,
+            confidence,
+            inference_time_ms,
+        )
+
         return result
 
     def predict_batch(self, audio_paths):
+        """Run inference over multiple audio files."""
+
         results = []
 
         for audio_path in audio_paths:
             try:
-                result = self.predict(audio_path)
+                results.append(
+                    self.predict(audio_path)
+                )
             except Exception as error:
-                result = {
-                    "audio_path": str(audio_path),
-                    "prediction": "ERROR",
-                    "error": str(error),
-                }
-
-            results.append(result)
+                logger.exception(
+                    "Batch inference failed for %s",
+                    audio_path,
+                )
+                results.append(
+                    {
+                        "audio_path": str(audio_path),
+                        "prediction": "ERROR",
+                        "error": str(error),
+                    }
+                )
 
         return results
 
@@ -206,8 +281,10 @@ _detector_instance = None
 def get_detector(
     model_path: Optional[str] = None,
     device: Optional[str] = None,
-    threshold: float = 0.5,
+    threshold: Optional[float] = None,
 ):
+    """Return the process-wide detector singleton."""
+
     global _detector_instance
 
     if _detector_instance is None:
@@ -224,8 +301,10 @@ def predict_audio(
     audio_path: str,
     model_path: Optional[str] = None,
     device: Optional[str] = None,
-    threshold: float = 0.5,
+    threshold: Optional[float] = None,
 ):
+    """Convenience wrapper for voice spoofing prediction."""
+
     detector = get_detector(
         model_path=model_path,
         device=device,
@@ -233,4 +312,3 @@ def predict_audio(
     )
 
     return detector.predict(audio_path)
-
