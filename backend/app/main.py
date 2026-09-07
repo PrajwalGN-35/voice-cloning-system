@@ -1,13 +1,13 @@
 ﻿from contextlib import asynccontextmanager
 from pathlib import Path
+import logging
 
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend.app.config import settings
-from fastapi import HTTPException
-
 from backend.app.services.audio_service import audio_service
 from backend.app.services.model_service import model_service
 from backend.app.services.voice_service import voice_service
@@ -15,6 +15,13 @@ from backend.app.services.deepfake_service import get_deepfake_service
 from backend.app.security.security_service import process_voice_security
 from backend.app.schemas.voice import VoiceCloneResponse
 from backend.app.utils.paths import initialize_directories
+from backend.app.errors.exceptions import AppError
+from backend.app.errors.handlers import (
+    app_error_handler,
+    create_request_id,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -30,6 +37,76 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    request_id = getattr(
+        request.state,
+        "request_id",
+        create_request_id(),
+    )
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "The request contains invalid or missing fields.",
+                "request_id": request_id,
+            },
+        },
+        headers={"X-Request-ID": request_id},
+    )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or create_request_id()
+    request.state.request_id = request_id
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "Unhandled request failure request_id=%s path=%s",
+            request_id,
+            request.url.path,
+        )
+        raise
+
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+app.add_exception_handler(AppError, app_error_handler)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    request: Request,
+    exc: HTTPException,
+):
+    request_id = getattr(
+        request.state,
+        "request_id",
+        create_request_id(),
+    )
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": {
+                "code": "HTTP_ERROR",
+                "message": str(exc.detail),
+                "request_id": request_id,
+            },
+        },
+        headers={"X-Request-ID": request_id},
+    )
 
 
 app.add_middleware(
@@ -84,32 +161,28 @@ async def upload_audio(file: UploadFile = File(...)):
     }
 
 
-
 @app.post("/api/v1/voice/analyze")
 async def analyze_voice(file: UploadFile = File(...)):
     """
     Analyze uploaded audio for voice authenticity.
 
     Pipeline:
-    Audio preprocessing → Member 5 deepfake detector → Member 4 risk engine.
+    Audio preprocessing ? Member 5 deepfake detector ? Member 4 risk engine.
     """
     if not file.filename:
         raise HTTPException(
             status_code=400,
-            detail="Audio file is required"
+            detail="Audio file is required",
         )
 
-    # Reuse the existing audio upload and preprocessing pipeline.
     uploaded = await audio_service.process_upload(file)
 
-    # Run Member 5 deepfake detector.
     detector = get_deepfake_service()
     detection = detector.analyze(uploaded["processed_file"])
 
-    # Run Member 4 security/risk engine.
     security = process_voice_security(
         detection["prediction"].lower(),
-        detection["confidence"]
+        detection["confidence"],
     )
 
     original_probability = detection["original_probability"]
@@ -130,6 +203,7 @@ async def analyze_voice(file: UploadFile = File(...)):
         "verification_method": security["verification_method"],
     }
 
+
 @app.post(
     "/api/v1/voice/clone",
     response_class=FileResponse,
@@ -137,14 +211,14 @@ async def analyze_voice(file: UploadFile = File(...)):
         200: {
             "description": "Generated cloned voice audio",
             "content": {
-                "audio/wav": {}
+                "audio/wav": {},
             },
         },
         400: {
-            "description": "Invalid audio or text"
+            "description": "Invalid audio or text",
         },
         500: {
-            "description": "Voice generation failed"
+            "description": "Voice generation failed",
         },
     },
 )
@@ -155,13 +229,13 @@ async def clone_voice(
     if not text or not text.strip():
         raise HTTPException(
             status_code=400,
-            detail="Text cannot be empty"
+            detail="Text cannot be empty",
         )
 
     if not reference_audio.filename:
         raise HTTPException(
             status_code=400,
-            detail="Reference audio file is required"
+            detail="Reference audio file is required",
         )
 
     uploaded = await audio_service.process_upload(reference_audio)
@@ -176,7 +250,7 @@ async def clone_voice(
     if not output_file.exists():
         raise HTTPException(
             status_code=500,
-            detail="Voice generation completed but output file was not found"
+            detail="Voice generation completed but output file was not found",
         )
 
     return FileResponse(
@@ -188,4 +262,5 @@ async def clone_voice(
             "X-Voice-Clone-Text-Length": str(len(text.strip())),
         },
     )
+
 
