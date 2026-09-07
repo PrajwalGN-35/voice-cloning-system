@@ -1,4 +1,5 @@
-﻿from pathlib import Path
+from pathlib import Path
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,7 +18,7 @@ class Settings(BaseSettings):
 
     frontend_origins: str = "http://localhost:3000,http://localhost:5173"
 
-    api_key: str = ""
+    api_key: str = Field(default="", validation_alias="VOICEGUARD_API_KEY")
     api_auth_enabled: bool = False
 
     model_config = SettingsConfigDict(
