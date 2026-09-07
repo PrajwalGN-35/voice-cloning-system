@@ -3,7 +3,13 @@ from fastapi.testclient import TestClient
 from backend.app.main import app
 
 
-client = TestClient(app)
+from backend.app.config import settings
+client = TestClient(
+    app,
+    headers={
+        "X-API-Key": settings.api_key,
+    },
+)
 
 
 def test_health_endpoint():
@@ -44,7 +50,9 @@ def test_clone_rejects_empty_text():
     )
 
     assert response.status_code == 400
-    assert "Text cannot be empty" in response.json()["detail"]
+    body = response.json()
+    assert body["success"] is False
+    assert "Text cannot be empty" in body["error"]["message"]
 
 
 def test_clone_requires_reference_audio():

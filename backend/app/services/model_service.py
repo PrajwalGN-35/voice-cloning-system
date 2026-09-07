@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 from qwen_tts import Qwen3TTSModel
 
 

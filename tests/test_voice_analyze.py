@@ -1,4 +1,5 @@
-﻿from pathlib import Path
+from backend.app.config import settings
+from pathlib import Path
 import os
 
 import pytest
@@ -7,7 +8,12 @@ from fastapi.testclient import TestClient
 from backend.app.main import app
 
 
-client = TestClient(app)
+client = TestClient(
+    app,
+    headers={
+        "X-API-Key": settings.api_key,
+    },
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", validation_alias="VOICEGUARD_API_KEY")
     api_auth_enabled: bool = False
 
+    # Rate limiting / abuse protection
+    rate_limit_enabled: bool = True
+    rate_limit_requests: int = 10
+    rate_limit_window_seconds: int = 60
+    clone_rate_limit_requests: int = 5
+
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",

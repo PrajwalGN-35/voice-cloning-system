@@ -1,13 +1,18 @@
-﻿from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
 import logging
-
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Depends
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-
 from backend.app.config import settings
+from backend.app.security import (
+    require_api_key,
+    rate_limit_analyze,
+    rate_limit_clone,
+    security_headers_middleware,
+    log_audit_event,
+)
 from backend.app.services.audio_service import audio_service
 from backend.app.services.model_service import model_service
 from backend.app.services.voice_service import voice_service
@@ -16,22 +21,16 @@ from backend.app.security.security_service import process_voice_security
 from backend.app.schemas.voice import VoiceCloneResponse
 from backend.app.utils.paths import initialize_directories
 from backend.app.errors.exceptions import AppError
-from backend.app.security import require_api_key
 from backend.app.errors.handlers import (
     app_error_handler,
     create_request_id,
 )
-
 logger = logging.getLogger(__name__)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     initialize_directories()
     model_service.load_model()
     yield
-
-
 app = FastAPI(
     title="AI Voice Cloning System",
     description="AI-powered authorized voice cloning backend",
@@ -48,7 +47,6 @@ async def validation_exception_handler(
         "request_id",
         create_request_id(),
     )
-
     return JSONResponse(
         status_code=422,
         content={
@@ -61,13 +59,13 @@ async def validation_exception_handler(
         },
         headers={"X-Request-ID": request_id},
     )
-
-
+@app.middleware("http")
+async def apply_security_headers(request: Request, call_next):
+    return await security_headers_middleware(request, call_next)
 @app.middleware("http")
 async def request_id_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or create_request_id()
     request.state.request_id = request_id
-
     try:
         response = await call_next(request)
     except Exception:
@@ -77,14 +75,9 @@ async def request_id_middleware(request: Request, call_next):
             request.url.path,
         )
         raise
-
     response.headers["X-Request-ID"] = request_id
     return response
-
-
 app.add_exception_handler(AppError, app_error_handler)
-
-
 @app.exception_handler(HTTPException)
 async def http_exception_handler(
     request: Request,
@@ -95,7 +88,6 @@ async def http_exception_handler(
         "request_id",
         create_request_id(),
     )
-
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -108,8 +100,6 @@ async def http_exception_handler(
         },
         headers={"X-Request-ID": request_id},
     )
-
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -121,8 +111,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
 @app.get("/")
 def root():
     return {
@@ -131,8 +119,6 @@ def root():
         "status": "running",
         "docs": "/docs",
     }
-
-
 @app.get("/api/v1/health")
 def health():
     return {
@@ -140,8 +126,6 @@ def health():
         "service": "AI Voice Cloning System",
         "version": "1.0.0",
     }
-
-
 @app.get("/api/v1/model/status")
 def model_status():
     return {
@@ -149,24 +133,24 @@ def model_status():
         "device": model_service.device,
         "loaded": model_service.is_loaded(),
     }
-
-
 @app.post("/api/v1/audio/upload")
 async def upload_audio(file: UploadFile = File(...)):
     result = await audio_service.process_upload(file)
-
     return {
         "success": True,
         "message": "Audio uploaded and preprocessed successfully",
         **result,
     }
-
-
-@app.post("/api/v1/voice/analyze", dependencies=[Depends(require_api_key)])
+@app.post(
+    "/api/v1/voice/analyze",
+    dependencies=[
+        Depends(require_api_key),
+        Depends(rate_limit_analyze),
+    ],
+)
 async def analyze_voice(file: UploadFile = File(...)):
     """
     Analyze uploaded audio for voice authenticity.
-
     Pipeline:
     Audio preprocessing ? Member 5 deepfake detector ? Member 4 risk engine.
     """
@@ -175,20 +159,15 @@ async def analyze_voice(file: UploadFile = File(...)):
             status_code=400,
             detail="Audio file is required",
         )
-
     uploaded = await audio_service.process_upload(file)
-
     detector = get_deepfake_service()
     detection = detector.analyze(uploaded["processed_file"])
-
     security = process_voice_security(
         detection["prediction"].lower(),
         detection["confidence"],
     )
-
     original_probability = detection["original_probability"]
     fake_probability = detection["fake_probability"]
-
     return {
         "success": True,
         "prediction": detection["prediction"],
@@ -203,10 +182,12 @@ async def analyze_voice(file: UploadFile = File(...)):
         "verification_required": security["verification_required"],
         "verification_method": security["verification_method"],
     }
-
-
 @app.post(
     "/api/v1/voice/clone",
+    dependencies=[
+        Depends(require_api_key),
+        Depends(rate_limit_clone),
+    ],
     response_class=FileResponse,
     responses={
         200: {
@@ -232,28 +213,22 @@ async def clone_voice(
             status_code=400,
             detail="Text cannot be empty",
         )
-
     if not reference_audio.filename:
         raise HTTPException(
             status_code=400,
             detail="Reference audio file is required",
         )
-
     uploaded = await audio_service.process_upload(reference_audio)
-
     result = voice_service.generate_voice(
         reference_file=uploaded["processed_file"],
         text=text.strip(),
     )
-
     output_file = Path(result["output_file"])
-
     if not output_file.exists():
         raise HTTPException(
             status_code=500,
             detail="Voice generation completed but output file was not found",
         )
-
     return FileResponse(
         path=str(output_file),
         media_type="audio/wav",
@@ -263,5 +238,3 @@ async def clone_voice(
             "X-Voice-Clone-Text-Length": str(len(text.strip())),
         },
     )
-
-

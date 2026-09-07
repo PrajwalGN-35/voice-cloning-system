@@ -1,4 +1,4 @@
-﻿import secrets
+import secrets
 
 from fastapi import Header, HTTPException
 
