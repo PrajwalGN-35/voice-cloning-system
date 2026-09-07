@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Python
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Environment / secrets
+.env
+
+# Logs
+*.log
+security_audit.log
+
+# Tests / development
+tests
+
+# Frontend / unrelated
+node_modules
+dist
+build
+
+# Runtime-generated data
+data/uploads/*
+data/processed/*
+data/generated/*
+
+# OS/editor
+.vscode
+.idea
+.DS_Store
+Thumbs.db
