@@ -1,4 +1,4 @@
-from contextlib import asynccontextmanager
+﻿from contextlib import asynccontextmanager
 from pathlib import Path
 import logging
 
@@ -26,7 +26,9 @@ from backend.app.services.audio_service import audio_service
 from backend.app.services.model_service import model_service
 from backend.app.services.voice_service import voice_service
 from backend.app.services.deepfake_service import get_deepfake_service
-from backend.app.security.security_service import process_voice_security
+from backend.app.services.audio_quality_service import AudioQualityService
+from backend.app.security.adaptive_risk_service import assess_adaptive_risk
+
 from backend.app.utils.paths import initialize_directories
 from backend.app.errors.exceptions import AppError
 from backend.app.errors.handlers import (
@@ -226,7 +228,7 @@ async def analyze_voice(file: UploadFile = File(...)):
     Analyze uploaded audio for voice authenticity.
 
     Pipeline:
-    Audio preprocessing -> Member 5 deepfake detector -> Member 4 risk engine.
+    Audio preprocessing -> Member 5 deepfake detector -> VoiceGuard reliability layer -> Member 4 adaptive risk decision.
     """
     if not file.filename:
         raise HTTPException(
@@ -240,9 +242,23 @@ async def analyze_voice(file: UploadFile = File(...)):
         detector = get_deepfake_service()
         detection = detector.analyze(uploaded["processed_file"])
 
-        security = process_voice_security(
+        # -------------------------------------------------
+        # VoiceGuard reliability assessment
+        # -------------------------------------------------
+        quality_service = AudioQualityService()
+        audio_quality = quality_service.analyze(
+            uploaded["processed_file"]
+        )
+
+        # -------------------------------------------------
+        # VoiceGuard adaptive security decision
+        # Member 4 base risk engine remains unchanged.
+        # -------------------------------------------------
+        security = assess_adaptive_risk(
             detection["prediction"].lower(),
             detection["confidence"],
+            audio_quality["quality"],
+            audio_quality["flags"],
         )
 
         original_probability = detection["original_probability"]
@@ -250,9 +266,12 @@ async def analyze_voice(file: UploadFile = File(...)):
 
         return {
             "success": True,
+
             "prediction": detection["prediction"],
+
             "original_probability": original_probability,
             "fake_probability": fake_probability,
+
             "original_percentage": round(
                 original_probability * 100,
                 4,
@@ -261,6 +280,13 @@ async def analyze_voice(file: UploadFile = File(...)):
                 fake_probability * 100,
                 4,
             ),
+
+            "confidence": detection["confidence"],
+            "decision_threshold": detection["threshold"],
+
+            "audio_quality": audio_quality,
+
+            "risk": security,
             "confidence": detection["confidence"],
             "risk_level": security["risk_level"],
             "action": security["action"],
@@ -345,3 +371,5 @@ async def clone_voice(
 
         if processed_file:
             audio_service.cleanup_processed_file(processed_file)
+
+

@@ -1,4 +1,4 @@
-def assess_risk(prediction, confidence):
+﻿def assess_risk(prediction, confidence):
     """
     Analyze the AI voice detection result
     and decide the security action.
