@@ -1,9 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
+from backend.app.security.domain_calibration import calibrate_live_result
 
 import asyncio
 import io
 import subprocess
 import time
+import wave
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
@@ -16,127 +18,68 @@ from backend.app.services.deepfake_service import DeepfakeDetectionService
 from backend.app.services.live_session_service import live_session_service
 from backend.app.security.adaptive_risk_service import assess_adaptive_risk
 
-
 router = APIRouter(prefix="/api/v1/live", tags=["live"])
 
-MAX_CHUNK_BYTES = 8 * 1024 * 1024
-MAX_STREAM_BYTES = 40 * 1024 * 1024
+LIVE_SAMPLE_RATE = 16000
+LIVE_CHANNELS = 1
+LIVE_SAMPLE_WIDTH = 2
 LIVE_WINDOW_SECONDS = 5
+MAX_PCM_BYTES = 8 * 1024 * 1024
 
 
-def _decode_stream_to_wav(stream_bytes: bytes) -> bytes:
-    """
-    Decode the complete continuous browser MediaRecorder stream.
-
-    MediaRecorder chunks are fragments of one container stream, so the
-    complete stream must be preserved before FFmpeg decoding.
-    """
-    process = subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            "pipe:0",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            "-f",
-            "wav",
-            "pipe:1",
-        ],
-        input=stream_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        check=False,
-    )
-
-    if process.returncode != 0 or not process.stdout:
-        error = process.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"FFmpeg could not decode live MediaRecorder stream: {error[-1000:]}"
-        )
-
-    return process.stdout
-
-
-def _extract_latest_window(wav_bytes: bytes) -> bytes:
-    """
-    Extract the latest five seconds from decoded 16 kHz mono PCM WAV.
-    """
-    import wave
-
-    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
-        channels = wav.getnchannels()
-        sample_width = wav.getsampwidth()
-        sample_rate = wav.getframerate()
-        frames = wav.readframes(wav.getnframes())
-
-    if channels != 1 or sample_width != 2 or sample_rate != 16000:
-        raise RuntimeError(
-            f"Unexpected decoded audio format: "
-            f"{sample_rate}Hz, {channels}ch, {sample_width * 8}bit"
-        )
-
-    required_frames = LIVE_WINDOW_SECONDS * sample_rate
-    total_frames = len(frames) // sample_width
-
-    if total_frames < required_frames:
-        raise RuntimeError(
-            f"Decoded audio is only {total_frames / sample_rate:.2f}s; "
-            f"{LIVE_WINDOW_SECONDS}s required"
-        )
-
-    latest_frames = frames[-required_frames:]
-
+def _pcm_to_wav(pcm_bytes: bytes) -> bytes:
     output = io.BytesIO()
-
-    with wave.open(output, "wb") as out:
-        out.setnchannels(1)
-        out.setsampwidth(2)
-        out.setframerate(16000)
-        out.writeframes(latest_frames)
-
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(LIVE_CHANNELS)
+        wav.setsampwidth(LIVE_SAMPLE_WIDTH)
+        wav.setframerate(LIVE_SAMPLE_RATE)
+        wav.writeframes(pcm_bytes)
     return output.getvalue()
 
 
-def _analyze_window(wav_bytes: bytes, sequence_number: int):
+def _extract_latest_window(pcm_bytes: bytes) -> bytes:
+    required_bytes = (
+        LIVE_SAMPLE_RATE
+        * LIVE_WINDOW_SECONDS
+        * LIVE_CHANNELS
+        * LIVE_SAMPLE_WIDTH
+    )
+
+    if len(pcm_bytes) < required_bytes:
+        raise RuntimeError("Not enough live PCM audio for a 5-second analysis window.")
+
+    return _pcm_to_wav(pcm_bytes[-required_bytes:])
+
+
+def _analyze_window(wav_bytes: bytes, sequence_number: int) -> dict:
     started = time.perf_counter()
 
-    detection_service = DeepfakeDetectionService()
+    detector = DeepfakeDetectionService()
     quality_service = AudioQualityService()
 
+    processed_dir = Path(settings.processed_dir)
+    processed_dir.mkdir(parents=True, exist_ok=True)
 
-    temp_dir = Path(settings.processed_dir)
-    temp_dir.mkdir(parents=True, exist_ok=True)
-
-    window_path = temp_dir / f"live_window_{sequence_number}_{int(time.time() * 1000)}.wav"
+    window_path = (
+        processed_dir
+        / f"live_window_{sequence_number}_{int(time.time() * 1000)}.wav"
+    )
 
     try:
         window_path.write_bytes(wav_bytes)
 
-        detection = detection_service.analyze(str(window_path))
-
+        detection = detector.analyze(str(window_path))
         quality = quality_service.analyze(str(window_path))
 
-        prediction = detection.get("prediction", "UNKNOWN")
+        prediction = str(detection.get("prediction", "UNKNOWN"))
         confidence = float(detection.get("confidence", 0.0))
-        fake_probability = float(detection.get("fake_probability", 0.0))
-        real_probability = float(detection.get("original_probability", 0.0))
+        fake_probability = float(
+            detection.get("fake_probability", 0.0)
+        )
+        real_probability = float(
+            detection.get("original_probability", 0.0)
+        )
         threshold = float(detection.get("threshold", 0.0))
-
-        risk_input = {
-            "prediction": prediction,
-            "confidence": confidence,
-            "fake_probability": fake_probability,
-            "real_probability": real_probability,
-            "threshold": threshold,
-        }
 
         quality_level = (
             quality.get("quality")
@@ -189,186 +132,194 @@ def _analyze_window(wav_bytes: bytes, sequence_number: int):
 
 
 @router.post("/session")
-async def create_live_session(_: object = Depends(require_api_key)):
+async def create_live_session(
+    _: object = Depends(require_api_key),
+):
     token = live_session_service.create_session()
 
     return JSONResponse(
         {
             "success": True,
             "token": token,
-            "expires_in_seconds": live_session_service.ttl_seconds,
+            "expires_in_seconds": 900,
         }
     )
 
 
 @router.get("/status")
-async def live_status():
+async def live_status(
+    _: object = Depends(require_api_key),
+):
     return {
         "success": True,
-        "service": "VoiceGuard live streaming",
+        "service": "live_voice_protection",
         "status": "ready",
-        "transport": "websocket",
+        "sample_rate": LIVE_SAMPLE_RATE,
         "window_seconds": LIVE_WINDOW_SECONDS,
-        "analysis": "AASIST + reliability + adaptive risk",
-        "windowing": "rolling",
+        "transport": "websocket_pcm",
     }
 
 
 @router.websocket("/ws")
 async def live_websocket(websocket: WebSocket):
-    """
-    VoiceGuard live streaming WebSocket.
+    origin = websocket.headers.get("origin")
 
-    The WebSocket handshake is accepted first so authentication,
-    origin and stream errors are communicated over the WebSocket
-    instead of being converted into an HTTP 403 handshake failure.
-    """
+    allowed_origins = [
+        item.strip()
+        for item in settings.frontend_origins.split(",")
+        if item.strip()
+    ]
+
+    if origin and origin not in allowed_origins:
+        await websocket.close(code=1008)
+        return
+
+    token = websocket.query_params.get("token")
+
+    if not token or not live_session_service.validate(token):
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
 
-    try:
-        origin = websocket.headers.get("origin")
+    buffer = bytearray()
+    sequence_number = 0
+    analyzing = False
 
-        allowed_origins = [
-            item.strip()
-            for item in settings.frontend_origins.split(",")
-            if item.strip()
-        ]
-
-        if origin and origin not in allowed_origins:
-            await websocket.send_json({
-                "type": "ERROR",
-                "success": False,
-                "code": "ORIGIN_NOT_ALLOWED",
-                "message": "Live WebSocket origin is not allowed.",
-                "origin": origin,
-            })
-            await websocket.close(code=1008)
-            return
-
-        token = websocket.query_params.get("token")
-
-        if not token or not live_session_service.validate(token):
-            await websocket.send_json({
-                "type": "ERROR",
-                "success": False,
-                "code": "INVALID_SESSION",
-                "message": "Live session token is missing or invalid.",
-            })
-            await websocket.close(code=1008)
-            return
-
-        await websocket.send_json({
+    await websocket.send_json(
+        {
             "type": "CONNECTED",
             "success": True,
             "window_seconds": LIVE_WINDOW_SECONDS,
             "windowing": "rolling",
-        })
+            "transport": "pcm_s16le",
+            "sample_rate": LIVE_SAMPLE_RATE,
+        }
+    )
 
-        stream_bytes = bytearray()
-        sequence_number = 0
-        last_analyzed_bytes = 0
-
+    try:
         while True:
             message = await websocket.receive()
 
             if message.get("type") == "websocket.disconnect":
                 break
 
-            if message.get("text") is not None:
-                text = message["text"]
+            text = message.get("text")
 
+            if text:
                 if text == "PING":
-                    await websocket.send_json({
-                        "type": "PONG",
-                        "success": True,
-                    })
+                    await websocket.send_json(
+                        {
+                            "type": "PONG",
+                            "success": True,
+                        }
+                    )
                 continue
 
-            chunk = message.get("bytes")
+            data = message.get("bytes")
 
-            if not chunk:
+            if not data:
                 continue
 
-            if len(chunk) > MAX_CHUNK_BYTES:
-                await websocket.send_json({
-                    "type": "ANALYSIS_ERROR",
-                    "success": False,
-                    "message": "Live audio chunk is too large.",
-                })
+            if len(data) > MAX_PCM_BYTES:
+                await websocket.send_json(
+                    {
+                        "type": "ERROR",
+                        "success": False,
+                        "message": "Live PCM chunk exceeds the allowed size.",
+                    }
+                )
                 continue
 
-            if len(stream_bytes) + len(chunk) > MAX_STREAM_BYTES:
-                await websocket.send_json({
-                    "type": "ANALYSIS_ERROR",
-                    "success": False,
-                    "message": "Live audio stream exceeded the safety limit.",
-                })
-                await websocket.close(code=1009)
-                return
+            buffer.extend(data)
 
-            stream_bytes.extend(chunk)
+            await websocket.send_json(
+                {
+                    "type": "CHUNK_RECEIVED",
+                    "success": True,
+                    "bytes": len(data),
+                    "buffer_bytes": len(buffer),
+                }
+            )
 
-            await websocket.send_json({
-                "type": "CHUNK_RECEIVED",
-                "success": True,
-                "bytes": len(chunk),
-            })
+            required_bytes = (
+                LIVE_SAMPLE_RATE
+                * LIVE_WINDOW_SECONDS
+                * LIVE_CHANNELS
+                * LIVE_SAMPLE_WIDTH
+            )
 
-            # MediaRecorder continuously sends container fragments.
-            # Decode the complete accumulated container and extract
-            # the newest 5-second PCM window.
-            try:
-                decoded = _decode_stream_to_wav(bytes(stream_bytes))
-                window = _extract_latest_window(decoded)
-            except Exception:
+            if len(buffer) < required_bytes or analyzing:
                 continue
 
-            # Avoid analyzing the exact same accumulated stream repeatedly.
-            if len(stream_bytes) <= last_analyzed_bytes:
-                continue
-
-            last_analyzed_bytes = len(stream_bytes)
             sequence_number += 1
 
-            await websocket.send_json({
-                "type": "WINDOW_READY",
-                "success": True,
-                "window_id": f"live-{sequence_number}",
-                "sequence_number": sequence_number,
-                "window_seconds": LIVE_WINDOW_SECONDS,
-            })
+            window_pcm = bytes(buffer[-required_bytes:])
 
-            try:
-                result = await asyncio.to_thread(
-                    _analyze_window,
-                    window,
+            keep_bytes = (
+                LIVE_SAMPLE_RATE
+                * 1
+                * LIVE_CHANNELS
+                * LIVE_SAMPLE_WIDTH
+            )
+
+            buffer = bytearray(buffer[-(required_bytes - keep_bytes):])
+
+            await websocket.send_json(
+                {
+                    "type": "WINDOW_READY",
+                    "success": True,
+                    "sequence_number": sequence_number,
+                    "window_seconds": LIVE_WINDOW_SECONDS,
+                }
+            )
+
+            analyzing = True
+
+            async def analyze_and_send(
+                pcm_window: bytes,
+                seq: int,
+            ):
+                nonlocal analyzing
+
+                try:
+                    wav_bytes = _pcm_to_wav(pcm_window)
+
+                    result = await asyncio.to_thread(
+                        _analyze_window,
+                        wav_bytes,
+                        seq,
+                    )
+
+                    result = calibrate_live_result(result)
+                    await websocket.send_json(result)
+
+                except Exception as error:
+                    await websocket.send_json(
+                        {
+                            "type": "ANALYSIS_ERROR",
+                            "success": False,
+                            "sequence_number": seq,
+                            "message": str(error),
+                        }
+                    )
+
+                finally:
+                    analyzing = False
+
+            asyncio.create_task(
+                analyze_and_send(
+                    window_pcm,
                     sequence_number,
                 )
-
-                await websocket.send_json(result)
-
-            except Exception as exc:
-                await websocket.send_json({
-                    "type": "ANALYSIS_ERROR",
-                    "success": False,
-                    "window_id": f"live-{sequence_number}",
-                    "sequence_number": sequence_number,
-                    "message": str(exc)[-1000:],
-                })
+            )
 
     except WebSocketDisconnect:
-        return
-    except Exception as exc:
-        try:
-            await websocket.send_json({
-                "type": "ERROR",
-                "success": False,
-                "message": str(exc)[-1000:],
-            })
-        except Exception:
-            pass
+        live_session_service.revoke(token)
+
+    except Exception:
+        live_session_service.revoke(token)
         try:
             await websocket.close(code=1011)
         except Exception:
             pass
-
