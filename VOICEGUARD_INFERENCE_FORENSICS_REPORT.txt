@@ -1,0 +1,1408 @@
+========================================
+ VOICEGUARD INFERENCE FORENSICS REPORT
+ Generated: 2026-09-09 00:51:13
+ Branch: feature/production-optimization
+========================================
+
+
+========================================
+[1] INFERENCE PIPELINE � predict.py
+========================================
+
+import logging
+import time
+from pathlib import Path
+from typing import Dict, Optional
+
+import torch
+
+from backend.app.ml.models.aasist import AASIST
+from backend.app.ml.preprocessing.audio_preprocessing import AudioPreprocessor
+
+
+logger = logging.getLogger(__name__)
+
+
+class VoiceSpoofingDetector:
+    """Production inference service for the calibrated voice spoofing model."""
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        device: Optional[str] = None,
+        threshold: Optional[float] = None,
+    ):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        self.device = torch.device(device)
+
+        self.preprocessor = AudioPreprocessor(
+            sample_rate=16000,
+            n_mels=128,
+            duration=5.0,
+        )
+
+        self.model = AASIST(num_classes=2)
+        self.model.to(self.device)
+        self.model.eval()
+
+        self.threshold = (
+            float(threshold)
+            if threshold is not None
+            else 0.5
+        )
+
+        logger.info(
+            "VoiceSpoofingDetector initialized on device=%s threshold=%s",
+            self.device,
+            self.threshold,
+        )
+
+        if model_path is not None:
+            self.load_model(model_path)
+        else:
+            logger.warning(
+                "No trained checkpoint was loaded. "
+                "Predictions are unreliable."
+            )
+
+    def load_model(self, model_path: str) -> None:
+        """Load model weights and calibrated threshold from checkpoint."""
+
+        checkpoint_path = Path(model_path)
+
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Checkpoint not found: {checkpoint_path}"
+            )
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+
+        if (
+            isinstance(checkpoint, dict)
+            and "model_state_dict" in checkpoint
+        ):
+            model_state = checkpoint["model_state_dict"]
+
+            if "threshold" in checkpoint:
+                self.threshold = float(checkpoint["threshold"])
+
+        else:
+            model_state = checkpoint
+
+        if not 0.0 < self.threshold < 1.0:
+            raise ValueError(
+                f"Invalid detection threshold: {self.threshold}"
+            )
+
+        self.model.load_state_dict(
+            model_state,
+            strict=True,
+        )
+
+        self.model.to(self.device)
+        self.model.eval()
+
+        logger.info(
+            "Checkpoint loaded successfully path=%s threshold=%s",
+            checkpoint_path,
+            self.threshold,
+        )
+
+    @staticmethod
+    def _validate_probabilities(
+        probability_real: float,
+        probability_fake: float,
+    ) -> None:
+        """Validate the model probability output."""
+
+        values = (
+            probability_real,
+            probability_fake,
+        )
+
+        if not all(torch.isfinite(torch.tensor(value)) for value in values):
+            raise RuntimeError(
+                "Model produced non-finite probabilities."
+            )
+
+        if any(value < 0.0 or value > 1.0 for value in values):
+            raise RuntimeError(
+                "Model produced probabilities outside [0, 1]."
+            )
+
+        if abs(
+            (probability_real + probability_fake) - 1.0
+        ) > 1e-4:
+            raise RuntimeError(
+                "Model probabilities do not sum to 1."
+            )
+
+    @torch.no_grad()
+    def predict(
+        self,
+        audio_path: str,
+        return_raw: bool = False,
+    ) -> Dict:
+        """Run calibrated voice spoofing inference."""
+
+        start_time = time.perf_counter()
+
+        audio_file = Path(audio_path)
+
+        if not audio_file.exists():
+            raise FileNotFoundError(
+                f"Audio file not found: {audio_file}"
+            )
+
+        mel_spectrogram, audio_information = (
+            self.preprocessor.preprocess(
+                str(audio_file),
+                verbose=False,
+            )
+        )
+
+        input_tensor = torch.tensor(
+            mel_spectrogram,
+            dtype=torch.float32,
+        )
+
+        input_tensor = (
+            input_tensor
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(self.device)
+        )
+
+        logits = self.model(input_tensor)
+
+        if logits.ndim != 2 or logits.shape[0] != 1 or logits.shape[1] != 2:
+            raise RuntimeError(
+                f"Unexpected model output shape: {tuple(logits.shape)}"
+            )
+
+        probabilities = torch.softmax(
+            logits,
+            dim=1,
+        )[0]
+
+        probability_real = float(
+            probabilities[0].cpu()
+        )
+
+        probability_fake = float(
+            probabilities[1].cpu()
+        )
+
+        self._validate_probabilities(
+            probability_real,
+            probability_fake,
+        )
+
+        if probability_fake >= self.threshold:
+            prediction = "FAKE"
+            confidence = probability_fake * 100
+        else:
+            prediction = "REAL"
+            confidence = probability_real * 100
+
+        inference_time_ms = (
+            time.perf_counter() - start_time
+        ) * 1000
+
+        result = {
+            "prediction": prediction,
+            "confidence": round(confidence, 2),
+            "fake_score": round(
+                probability_fake,
+                6,
+            ),
+            "probabilities": {
+                "real": round(
+                    probability_real,
+                    6,
+                ),
+                "fake": round(
+                    probability_fake,
+                    6,
+                ),
+            },
+            "threshold": self.threshold,
+            "audio_path": str(audio_file),
+            "inference_time_ms": round(
+                inference_time_ms,
+                2,
+            ),
+        }
+
+        if return_raw:
+            result["raw_scores"] = {
+                "real": float(
+                    logits[0][0].cpu()
+                ),
+                "fake": float(
+                    logits[0][1].cpu()
+                ),
+            }
+
+        logger.info(
+            "Voice inference completed prediction=%s "
+            "confidence=%.2f inference_time_ms=%.2f",
+            prediction,
+            confidence,
+            inference_time_ms,
+        )
+
+        return result
+
+    def predict_batch(self, audio_paths):
+        """Run inference over multiple audio files."""
+
+        results = []
+
+        for audio_path in audio_paths:
+            try:
+                results.append(
+                    self.predict(audio_path)
+                )
+            except Exception as error:
+                logger.exception(
+                    "Batch inference failed for %s",
+                    audio_path,
+                )
+                results.append(
+                    {
+                        "audio_path": str(audio_path),
+                        "prediction": "ERROR",
+                        "error": str(error),
+                    }
+                )
+
+        return results
+
+
+_detector_instance = None
+
+
+def get_detector(
+    model_path: Optional[str] = None,
+    device: Optional[str] = None,
+    threshold: Optional[float] = None,
+):
+    """Return the process-wide detector singleton."""
+
+    global _detector_instance
+
+    if _detector_instance is None:
+        _detector_instance = VoiceSpoofingDetector(
+            model_path=model_path,
+            device=device,
+            threshold=threshold,
+        )
+
+    return _detector_instance
+
+
+def predict_audio(
+    audio_path: str,
+    model_path: Optional[str] = None,
+    device: Optional[str] = None,
+    threshold: Optional[float] = None,
+):
+    """Convenience wrapper for voice spoofing prediction."""
+
+    detector = get_detector(
+        model_path=model_path,
+        device=device,
+        threshold=threshold,
+    )
+
+    return detector.predict(audio_path)
+
+========================================
+[2] AASIST ARCHITECTURE � aasist.py
+========================================
+
+"""
+AASIST Model Architecture for Voice Spoofing Detection
+
+Simplified implementation of Audio Anti-Spoofing using Integrated 
+Spectro-Temporal Graph Attention Networks.
+
+Reference: Li et al., "AASIST: Audio Anti-Spoofing using Integrated 
+Spectro-Temporal Graph Attention Networks", ICASSP 2022
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ConvBlock(nn.Module):
+    """Convolutional block: Conv → BatchNorm → ReLU → Dropout"""
+    
+    def __init__(self, in_channels, out_channels, kernel_size, padding=1, dropout=0.2):
+        super(ConvBlock, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        return x
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with skip connection"""
+    
+    def __init__(self, channels, dropout=0.2):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = ConvBlock(channels, channels, (3, 3), padding=1, dropout=dropout)
+        self.conv2 = ConvBlock(channels, channels, (3, 3), padding=1, dropout=dropout)
+    
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + residual
+        return out
+
+
+class SelfAttention(nn.Module):
+    """Multi-head self-attention module"""
+    
+    def __init__(self, channels, num_heads=8):
+        super(SelfAttention, self).__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        
+        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+        
+        self.head_dim = channels // num_heads
+        
+        self.query = nn.Linear(channels, channels)
+        self.key = nn.Linear(channels, channels)
+        self.value = nn.Linear(channels, channels)
+        self.fc_out = nn.Linear(channels, channels)
+    
+    def forward(self, x):
+        # x: (batch, channels, height, width)
+        batch, channels, height, width = x.shape
+        
+        # Flatten spatial dimensions
+        x_flat = x.view(batch, channels, -1).transpose(1, 2)  # (batch, HW, channels)
+        
+        # Linear projections
+        Q = self.query(x_flat)
+        K = self.key(x_flat)
+        V = self.value(x_flat)
+        
+        # Split into multiple heads
+        Q = Q.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attention = F.softmax(scores, dim=-1)
+        
+        # Attention output
+        out = torch.matmul(attention, V)
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(batch, -1, channels)
+        
+        # Final linear layer
+        out = self.fc_out(out)
+        
+        # Reshape back to spatial format
+        out = out.transpose(1, 2).view(batch, channels, height, width)
+        
+        return out
+
+
+class AASIST(nn.Module):
+    """
+    AASIST Model for Voice Spoofing Detection
+    
+    Architecture:
+    1. Convolutional frontend (multi-scale feature extraction)
+    2. Residual blocks (deep feature learning)
+    3. Self-attention (spectro-temporal modeling)
+    4. Global average pooling
+    5. Classification head
+    """
+    
+    def __init__(self, num_classes=2, dropout=0.2, num_heads=8):
+        super(AASIST, self).__init__()
+        
+        self.num_classes = num_classes
+        
+        # Convolutional Frontend
+        # Input: (batch, 1, 128, time_steps)
+        self.conv1 = ConvBlock(1, 32, (3, 3), padding=1, dropout=dropout)  # (batch, 32, 128, time_steps)
+        self.pool1 = nn.MaxPool2d((2, 2))  # (batch, 32, 64, time_steps/2)
+        
+        self.conv2 = ConvBlock(32, 64, (3, 3), padding=1, dropout=dropout)  # (batch, 64, 64, time_steps/2)
+        self.pool2 = nn.MaxPool2d((2, 2))  # (batch, 64, 32, time_steps/4)
+        
+        self.conv3 = ConvBlock(64, 128, (3, 3), padding=1, dropout=dropout)  # (batch, 128, 32, time_steps/4)
+        self.pool3 = nn.MaxPool2d((2, 2))  # (batch, 128, 16, time_steps/8)
+        
+        # Residual Blocks
+        self.res_block1 = ResidualBlock(128, dropout=dropout)
+        self.res_block2 = ResidualBlock(128, dropout=dropout)
+        
+        # Self-Attention Layer
+        self.attention = SelfAttention(128, num_heads=num_heads)
+        
+        # Global Average Pooling
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Classification Head
+        self.fc1 = nn.Linear(128, 256)
+        self.dropout_fc = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(256, num_classes)
+    
+    def forward(self, x):
+        """
+        Forward pass
+        
+        Args:
+            x: Input tensor of shape (batch, 1, 128, time_steps)
+               where 128 is number of mel-frequency bins
+               
+        Returns:
+            logits: Tensor of shape (batch, num_classes)
+        """
+        # Convolutional frontend
+        x = self.conv1(x)
+        x = self.pool1(x)
+        
+        x = self.conv2(x)
+        x = self.pool2(x)
+        
+        x = self.conv3(x)
+        x = self.pool3(x)
+        
+        # Residual blocks
+        x = self.res_block1(x)
+        x = self.res_block2(x)
+        
+        # Self-attention
+        x = self.attention(x)
+        
+        # Global average pooling
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        
+        # Classification head
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout_fc(x)
+        logits = self.fc2(x)
+        
+        return logits
+
+
+class LossFunction(nn.Module):
+    """Combined loss function for voice spoofing detection"""
+    
+    def __init__(self, loss_type='cross_entropy'):
+        super(LossFunction, self).__init__()
+        self.loss_type = loss_type
+        
+        if loss_type == 'cross_entropy':
+            self.loss_fn = nn.CrossEntropyLoss()
+        elif loss_type == 'focal':
+            self.loss_fn = FocalLoss()
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+    
+    def forward(self, logits, labels):
+        return self.loss_fn(logits, labels)
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for imbalanced classification"""
+    
+    def __init__(self, alpha=1.0, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, logits, labels):
+        ce_loss = F.cross_entropy(logits, labels, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("AASIST Model Test")
+    print("="*70)
+    
+    # Create model
+    model = AASIST(num_classes=2)
+    print(f"\n✓ Model created successfully!")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Test forward pass
+    batch_size = 4
+    x = torch.randn(batch_size, 1, 128, 501)  # (batch, channels, mel_bins, time_steps)
+    
+    print(f"\n📍 Testing forward pass...")
+    print(f"  Input shape: {x.shape}")
+    
+    logits = model(x)
+    print(f"  Output shape: {logits.shape}")
+    print(f"  Expected shape: ({batch_size}, 2)")
+    
+    # Test loss calculation
+    labels = torch.LongTensor([0, 1, 0, 1])
+    loss_fn = LossFunction(loss_type='cross_entropy')
+    loss = loss_fn(logits, labels)
+    
+    print(f"\n✓ Loss calculation successful!")
+    print(f"  Loss value: {loss.item():.4f}")
+    
+    # Test backward pass
+    loss.backward()
+    print(f"\n✓ Backward pass successful!")
+    
+    print(f"\n✅ AASIST model test PASSED!")
+
+========================================
+[3] AUDIO PREPROCESSING � audio_preprocessing.py
+========================================
+
+"""
+Audio Preprocessing Pipeline for Voice Spoofing Detection
+
+This module provides reusable functions for audio preprocessing,
+designed to work with AASIST and other voice spoofing detection models.
+"""
+
+import numpy as np
+import librosa
+import soundfile as sf
+from typing import Union, Tuple
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class AudioPreprocessor:
+    """
+    Handles audio loading, preprocessing, and feature extraction for voice spoofing detection.
+    
+    Attributes:
+        sample_rate (int): Target sample rate (default: 16000 Hz)
+        n_mels (int): Number of mel-frequency bins (default: 128)
+        n_fft (int): FFT size (default: 512)
+        hop_length (int): Number of samples between successive frames (default: 160)
+    """
+    
+    def __init__(self, sample_rate: int = 16000, n_mels: int = 128, 
+                 n_fft: int = 512, hop_length: int = 160, 
+                 duration: float = 5.0):
+        """
+        Initialize audio preprocessor.
+        
+        Args:
+            sample_rate (int): Target sample rate in Hz
+            n_mels (int): Number of mel-frequency bins
+            n_fft (int): FFT window size
+            hop_length (int): Hop length for STFT
+            duration (float): Audio duration in seconds (for padding/truncation)
+        """
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.duration = duration
+        self.max_samples = int(sample_rate * duration)
+    
+    def load_audio(self, audio_path: str) -> np.ndarray:
+        """
+        Load audio file and resample to target sample rate.
+        
+        Args:
+            audio_path (str): Path to audio file (WAV, FLAC, MP3, etc.)
+            
+        Returns:
+            np.ndarray: Audio waveform (mono, normalized to [-1, 1])
+            
+        Raises:
+            FileNotFoundError: If audio file doesn't exist
+            RuntimeError: If audio file cannot be loaded
+        """
+        try:
+            # Load audio and resample to target sample rate
+            audio, sr = librosa.load(audio_path, sr=self.sample_rate, mono=True)
+            logger.info(f"✓ Loaded audio: {audio_path} (duration: {len(audio)/self.sample_rate:.2f}s)")
+            return audio
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load audio: {str(e)}")
+    
+    def normalize_audio(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Normalize audio to [-1, 1] range.
+        
+        Args:
+            audio (np.ndarray): Audio waveform
+            
+        Returns:
+            np.ndarray: Normalized audio
+        """
+        # Remove any DC offset
+        audio = audio - np.mean(audio)
+        
+        # Normalize by peak amplitude
+        max_val = np.max(np.abs(audio))
+        if max_val > 0:
+            audio = audio / max_val
+        
+        return audio
+    
+    def pad_or_truncate(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Pad or truncate audio to fixed duration.
+        
+        Args:
+            audio (np.ndarray): Audio waveform
+            
+        Returns:
+            np.ndarray: Audio padded/truncated to fixed length
+        """
+        if len(audio) < self.max_samples:
+            # Pad with zeros
+            pad_amount = self.max_samples - len(audio)
+            audio = np.pad(audio, (0, pad_amount), mode='constant', constant_values=0)
+            logger.info(f"✓ Padded audio to {len(audio)} samples")
+        else:
+            # Truncate
+            audio = audio[:self.max_samples]
+            logger.info(f"✓ Truncated audio to {len(audio)} samples")
+        
+        return audio
+    
+    def extract_mel_spectrogram(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Extract mel-spectrogram from audio waveform.
+        
+        Args:
+            audio (np.ndarray): Audio waveform
+            
+        Returns:
+            np.ndarray: Mel-spectrogram (n_mels, time_steps)
+        """
+        # Compute mel-spectrogram
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio,
+            sr=self.sample_rate,
+            n_mels=self.n_mels,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length
+        )
+        
+        # Convert to log scale (in dB)
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        logger.info(f"✓ Extracted mel-spectrogram: {mel_spec_db.shape}")
+        return mel_spec_db
+    
+    def preprocess(self, audio_path: str, verbose: bool = True) -> Tuple[np.ndarray, dict]:
+        """
+        Complete preprocessing pipeline: load → normalize → pad/truncate → extract mel-spec.
+        
+        Args:
+            audio_path (str): Path to audio file
+            verbose (bool): Print progress messages
+            
+        Returns:
+            Tuple containing:
+                - np.ndarray: Processed mel-spectrogram (128, ~157)
+                - dict: Metadata with original duration, sample rate, shape
+        """
+        # Load and normalize
+        audio = self.load_audio(audio_path)
+        audio = self.normalize_audio(audio)
+        
+        # Pad/truncate
+        audio = self.pad_or_truncate(audio)
+        
+        # Extract mel-spectrogram
+        mel_spec = self.extract_mel_spectrogram(audio)
+        
+        # Collect metadata
+        metadata = {
+            'original_duration': len(audio) / self.sample_rate,
+            'sample_rate': self.sample_rate,
+            'mel_spec_shape': mel_spec.shape,
+            'n_mels': self.n_mels,
+            'audio_path': audio_path
+        }
+        
+        if verbose:
+            logger.info(f"✓ Preprocessing complete!\n  Shape: {mel_spec.shape}\n  Duration: {metadata['original_duration']:.2f}s")
+        
+        return mel_spec, metadata
+
+
+def preprocess_audio_file(audio_path: str, sample_rate: int = 16000, 
+                         duration: float = 5.0) -> Tuple[np.ndarray, dict]:
+    """
+    Standalone function to preprocess a single audio file.
+    
+    Args:
+        audio_path (str): Path to audio file
+        sample_rate (int): Target sample rate
+        duration (float): Target duration in seconds
+        
+    Returns:
+        Tuple of (mel_spectrogram, metadata_dict)
+    """
+    preprocessor = AudioPreprocessor(sample_rate=sample_rate, duration=duration)
+    return preprocessor.preprocess(audio_path)
+
+========================================
+[4] DEEPFAKE SERVICE � deepfake_service.py
+========================================
+
+from pathlib import Path
+from typing import Dict
+
+from backend.app.ml.inference.predict import VoiceSpoofingDetector
+
+
+MODEL_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "ml"
+    / "checkpoints"
+    / "latest_calibrated.pth"
+)
+
+
+class DeepfakeDetectionService:
+    """Service layer for Member 5 voice spoofing detection."""
+
+    def __init__(self):
+        self.detector = VoiceSpoofingDetector(
+            model_path=str(MODEL_PATH)
+        )
+
+    def analyze(self, audio_path: str) -> Dict:
+        """Analyze an audio file and return model prediction."""
+        result = self.detector.predict(
+            audio_path,
+            return_raw=True
+        )
+
+        return {
+            "prediction": result["prediction"],
+            "confidence": result["confidence"],
+            "original_probability": result["probabilities"]["real"],
+            "fake_probability": result["probabilities"]["fake"],
+            "threshold": result["threshold"],
+            "raw_scores": result.get("raw_scores"),
+        }
+
+
+_detector_service = None
+
+
+def get_deepfake_service() -> DeepfakeDetectionService:
+    """Return a singleton detector service."""
+    global _detector_service
+
+    if _detector_service is None:
+        _detector_service = DeepfakeDetectionService()
+
+    return _detector_service
+
+========================================
+[5] MODEL SERVICE � model_service.py
+========================================
+
+import torch
+from qwen_tts import Qwen3TTSModel
+
+
+class ModelService:
+    def __init__(self):
+        self.model = None
+        self.model_name = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+        self.device = "cpu"
+
+    def load_model(self):
+        if self.model is not None:
+            return
+
+        print("Loading Qwen3-TTS model...")
+
+        self.model = Qwen3TTSModel.from_pretrained(
+            self.model_name,
+            device_map=self.device,
+            dtype=torch.float32,
+        )
+
+        print("Qwen3-TTS model loaded successfully.")
+
+    def is_loaded(self):
+        return self.model is not None
+
+
+model_service = ModelService()
+
+========================================
+[6] PHASE 12 TESTS
+========================================
+
+import torch
+import pytest
+
+from backend.app.ml.inference.predict import VoiceSpoofingDetector
+
+
+CHECKPOINT = (
+    "backend/app/ml/checkpoints/latest_calibrated.pth"
+)
+
+REAL_AUDIO = (
+    r"C:\Users\Prajwal G N\Desktop\member5-voice-detector\test_audio.wav"
+)
+
+FAKE_AUDIO = (
+    r"C:\Users\Prajwal G N\Desktop\member5-voice-detector"
+    r"\dataset\LA_demo\test\LA_test_0003_0000000.flac"
+)
+
+
+def test_calibrated_threshold_is_loaded():
+    detector = VoiceSpoofingDetector(
+        model_path=CHECKPOINT
+    )
+
+    assert detector.threshold == pytest.approx(
+        0.9912435405405405
+    )
+
+
+def test_probability_validation_accepts_valid_output():
+    VoiceSpoofingDetector._validate_probabilities(
+        0.25,
+        0.75,
+    )
+
+
+def test_probability_validation_rejects_invalid_sum():
+    with pytest.raises(RuntimeError):
+        VoiceSpoofingDetector._validate_probabilities(
+            0.25,
+            0.60,
+        )
+
+
+def test_probability_validation_rejects_out_of_range():
+    with pytest.raises(RuntimeError):
+        VoiceSpoofingDetector._validate_probabilities(
+            1.2,
+            -0.2,
+        )
+
+
+def test_real_audio_regression():
+    detector = VoiceSpoofingDetector(
+        model_path=CHECKPOINT
+    )
+
+    result = detector.predict(
+        REAL_AUDIO,
+        return_raw=True,
+    )
+
+    assert result["prediction"] == "REAL"
+    assert result["probabilities"]["real"] == pytest.approx(
+        0.653503,
+        abs=1e-5,
+    )
+    assert result["probabilities"]["fake"] == pytest.approx(
+        0.346497,
+        abs=1e-5,
+    )
+    assert result["inference_time_ms"] >= 0
+
+
+def test_fake_audio_regression():
+    detector = VoiceSpoofingDetector(
+        model_path=CHECKPOINT
+    )
+
+    result = detector.predict(
+        FAKE_AUDIO,
+        return_raw=True,
+    )
+
+    assert result["prediction"] == "FAKE"
+    assert result["probabilities"]["fake"] == pytest.approx(
+        0.999998,
+        abs=1e-5,
+    )
+    assert result["probabilities"]["real"] == pytest.approx(
+        0.000002,
+        abs=1e-5,
+    )
+    assert result["inference_time_ms"] >= 0
+
+
+def test_missing_audio_is_rejected():
+    detector = VoiceSpoofingDetector(
+        model_path=CHECKPOINT
+    )
+
+    with pytest.raises(FileNotFoundError):
+        detector.predict(
+            "this-file-does-not-exist.wav"
+        )
+
+
+def test_model_output_shape_is_validated():
+    detector = VoiceSpoofingDetector(
+        model_path=CHECKPOINT
+    )
+
+    class InvalidModel:
+        def __call__(self, _input):
+            return torch.zeros((1, 3))
+
+    detector.model = InvalidModel()
+
+    with pytest.raises(RuntimeError):
+        detector.predict(REAL_AUDIO)
+
+========================================
+[7] VOICE ANALYSIS TESTS
+========================================
+
+from backend.app.config import settings
+from pathlib import Path
+import os
+
+import pytest
+from fastapi.testclient import TestClient
+
+from backend.app.main import app
+
+
+client = TestClient(
+    app,
+    headers={
+        "X-API-Key": settings.api_key,
+    },
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+FAKE_AUDIO = PROJECT_ROOT / "tests" / "fixtures" / "fake_voice.flac"
+
+REAL_AUDIO_ENV = os.getenv("VOICE_REAL_TEST_AUDIO")
+
+
+def test_analyze_real_audio():
+    """Run the detector on a known local REAL audio file when configured."""
+
+    if not REAL_AUDIO_ENV:
+        pytest.skip(
+            "VOICE_REAL_TEST_AUDIO is not configured; "
+            "skipping local REAL-audio integration test."
+        )
+
+    real_audio = Path(REAL_AUDIO_ENV)
+
+    assert real_audio.exists(), f"Missing real test audio: {real_audio}"
+
+    with real_audio.open("rb") as audio:
+        response = client.post(
+            "/api/v1/voice/analyze",
+            files={
+                "file": (
+                    real_audio.name,
+                    audio,
+                    "audio/wav",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["success"] is True
+    assert data["prediction"] in {"REAL", "FAKE"}
+
+    assert 0 <= data["original_probability"] <= 1
+    assert 0 <= data["fake_probability"] <= 1
+
+    assert abs(
+        (data["original_probability"] + data["fake_probability"]) - 1
+    ) < 0.001
+
+
+def test_analyze_fake_audio():
+    """Known Member 5 FAKE fixture should be blocked by risk engine."""
+
+    assert FAKE_AUDIO.exists(), f"Missing fake fixture: {FAKE_AUDIO}"
+
+    with FAKE_AUDIO.open("rb") as audio:
+        response = client.post(
+            "/api/v1/voice/analyze",
+            files={
+                "file": (
+                    FAKE_AUDIO.name,
+                    audio,
+                    "audio/flac",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["success"] is True
+    assert data["prediction"] == "FAKE"
+
+    assert 0 <= data["original_probability"] <= 1
+    assert 0 <= data["fake_probability"] <= 1
+
+    assert data["risk_level"] == "HIGH"
+    assert data["action"] == "BLOCK"
+
+    assert data["verification_required"] is True
+    assert data["verification_method"] == "OTP + SECONDARY_CHECK"
+
+
+def test_analyze_response_contains_required_fields():
+    """API contract should expose all frontend-required fields."""
+
+    assert FAKE_AUDIO.exists(), f"Missing fake fixture: {FAKE_AUDIO}"
+
+    required_fields = {
+        "success",
+        "prediction",
+        "original_probability",
+        "fake_probability",
+        "original_percentage",
+        "fake_percentage",
+        "confidence",
+        "risk_level",
+        "action",
+        "message",
+        "verification_required",
+        "verification_method",
+    }
+
+    with FAKE_AUDIO.open("rb") as audio:
+        response = client.post(
+            "/api/v1/voice/analyze",
+            files={
+                "file": (
+                    FAKE_AUDIO.name,
+                    audio,
+                    "audio/flac",
+                )
+            },
+        )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert required_fields.issubset(data.keys())
+
+
+def test_analyze_requires_audio_file():
+    """Endpoint should reject requests without an uploaded audio file."""
+
+    response = client.post("/api/v1/voice/analyze")
+
+    assert response.status_code == 422
+
+========================================
+[8] CHECKPOINT / MODEL FILES
+========================================
+
+
+FullName                                                                                                               Length LastWriteTime      
+--------                                                                                                               ------ -------------      
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\checkpoints\latest_calibrated.pth 9469762 06-09-2026 20:34:18
+
+
+
+
+========================================
+[9] PROJECT LABEL / CLASS REFERENCES
+========================================
+
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:130:         real_probability = float(detection.get("original_probability", 0.0))
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:137:             "real_probability": real_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:175:             "real_probability": real_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:15: from backend.app.services.deepfake_service import DeepfakeDetectionService
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:111:     detection_service = DeepfakeDetectionService()
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:129:         fake_probability = float(detection.get("fake_probability", 0.0))
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:136:             "fake_probability": fake_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:176:             "fake_probability": fake_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:130:         real_probability = float(detection.get("original_probability", 0.0))
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:129:         fake_probability = float(detection.get("fake_probability", 0.0))
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:136:             "fake_probability": fake_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:176:             "fake_probability": fake_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:131:         threshold = float(detection.get("threshold", 0.0))
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:138:             "threshold": threshold,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\api\live.py:177:             "threshold": threshold,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\errors\exceptions.py:36:     """Raised when deepfake detection cannot be completed."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:28: from backend.app.services.deepfake_service import get_deepfake_service
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:230:     Audio preprocessing -> Member 5 deepfake detector -> VoiceGuard reliability layer -> Member 4 adaptive risk decision.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:241:         detector = get_deepfake_service()
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:264:         fake_probability = detection["fake_probability"]
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:272:             "fake_probability": fake_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:278:             "fake_percentage": round(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:279:                 fake_probability * 100,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:263:         original_probability = detection["original_probability"]
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:271:             "original_probability": original_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:275:                 original_probability * 100,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:264:         fake_probability = detection["fake_probability"]
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:272:             "fake_probability": fake_probability,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:279:                 fake_probability * 100,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\main.py:284:             "decision_threshold": detection["threshold"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:15: class VoiceSpoofingDetector:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:16:     """Production inference service for the calibrated voice spoofing model."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:46:             "VoiceSpoofingDetector initialized on device=%s threshold=%s",
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:141:         """Run calibrated voice spoofing inference."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:291:         _detector_instance = VoiceSpoofingDetector(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:306:     """Convenience wrapper for voice spoofing prediction."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:108:         probability_real: float,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:114:             probability_real,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:129:             (probability_real + probability_fake) - 1.0
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:183:         probability_real = float(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:192:             probability_real,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:200:             prediction = "REAL"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:201:             confidence = probability_real * 100
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:215:                 "real": round(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:216:                     probability_real,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:234:                 "real": float(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:109:         probability_fake: float,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:115:             probability_fake,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:129:             (probability_real + probability_fake) - 1.0
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:187:         probability_fake = float(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:193:             probability_fake,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:196:         if probability_fake >= self.threshold:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:197:             prediction = "FAKE"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:198:             confidence = probability_fake * 100
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:210:             "fake_score": round(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:211:                 probability_fake,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:219:                 "fake": round(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:220:                     probability_fake,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:237:                 "fake": float(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:178:         probabilities = torch.softmax(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:22:         threshold: Optional[float] = None,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:39:         self.threshold = (
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:40:             float(threshold)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:41:             if threshold is not None
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:46:             "VoiceSpoofingDetector initialized on device=%s threshold=%s",
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:48:             self.threshold,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:60:         """Load model weights and calibrated threshold from checkpoint."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:81:             if "threshold" in checkpoint:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:82:                 self.threshold = float(checkpoint["threshold"])
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:87:         if not 0.0 < self.threshold < 1.0:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:89:                 f"Invalid detection threshold: {self.threshold}"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:101:             "Checkpoint loaded successfully path=%s threshold=%s",
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:103:             self.threshold,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:196:         if probability_fake >= self.threshold:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:224:             "threshold": self.threshold,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:284:     threshold: Optional[float] = None,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:294:             threshold=threshold,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:304:     threshold: Optional[float] = None,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:311:         threshold=threshold,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:2: AASIST Model Architecture for Voice Spoofing Detection
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:4: Simplified implementation of Audio Anti-Spoofing using Integrated 
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:7: Reference: Li et al., "AASIST: Audio Anti-Spoofing using Integrated 
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:106:     AASIST Model for Voice Spoofing Detection
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:189:     """Combined loss function for voice spoofing detection"""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:88:         attention = F.softmax(scores, dim=-1)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:202:     def forward(self, logits, labels):
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:203:         return self.loss_fn(logits, labels)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:214:     def forward(self, logits, labels):
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:215:         ce_loss = F.cross_entropy(logits, labels, reduction='none')
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:243:     labels = torch.LongTensor([0, 1, 0, 1])
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\models\aasist.py:245:     loss = loss_fn(logits, labels)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:2: Audio Preprocessing Pipeline for Voice Spoofing Detection
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:5: designed to work with AASIST and other voice spoofing detection models.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:20:     Handles audio loading, preprocessing, and feature extraction for voice spoofing detection.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:23:         sample_rate (int): Target sample rate (default: 16000 Hz)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:36:             sample_rate (int): Target sample rate in Hz
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:51:         Load audio file and resample to target sample rate.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:64:             # Load audio and resample to target sample rate
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:185:         sample_rate (int): Target sample rate
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\preprocessing\audio_preprocessing.py:186:         duration (float): Target duration in seconds
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\security\adaptive_risk_service.py:25:     # Preserve a high-confidence FAKE decision.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\security\risk_engine.py:30:     if prediction not in ["real", "fake"]:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\security\risk_engine.py:30:     if prediction not in ["real", "fake"]:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\security\risk_engine.py:40:     if prediction == "fake" and confidence >= 80:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\security\risk_engine.py:50:     elif prediction == "fake" and confidence >= 50:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\audio_quality_service.py:12:     This layer does NOT determine whether a voice is real or fake.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\audio_quality_service.py:12:     This layer does NOT determine whether a voice is real or fake.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\audio_quality_service.py:37:         silence_threshold = 0.01
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\audio_quality_service.py:39:             np.mean(np.abs(audio) < silence_threshold)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\audio_quality_service.py:42:         clipping_threshold = 0.999
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\audio_quality_service.py:44:             np.mean(np.abs(audio) >= clipping_threshold)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\audio_service.py:267:             # processing, such as deepfake detection, has completed.
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:4: from backend.app.ml.inference.predict import VoiceSpoofingDetector
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:16:     """Service layer for Member 5 voice spoofing detection."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:19:         self.detector = VoiceSpoofingDetector(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:33:             "original_probability": result["probabilities"]["real"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:15: class DeepfakeDetectionService:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:34:             "fake_probability": result["probabilities"]["fake"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:43: def get_deepfake_service() -> DeepfakeDetectionService:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:48:         _detector_service = DeepfakeDetectionService()
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:33:             "original_probability": result["probabilities"]["real"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:34:             "fake_probability": result["probabilities"]["fake"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:35:             "threshold": result["threshold"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase11_security.py:51:     class FakeRequest:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase11_security.py:57:             FakeRequest(),
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase11_security.py:64:             FakeRequest(),
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase11_security.py:72:                 FakeRequest(),
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase11_security.py:101:     class FakeRequest:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase11_security.py:107:             FakeRequest(),
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:4: from backend.app.ml.inference.predict import VoiceSpoofingDetector
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:22:     detector = VoiceSpoofingDetector(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:32:     VoiceSpoofingDetector._validate_probabilities(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:40:         VoiceSpoofingDetector._validate_probabilities(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:48:         VoiceSpoofingDetector._validate_probabilities(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:55:     detector = VoiceSpoofingDetector(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:77:     detector = VoiceSpoofingDetector(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:99:     detector = VoiceSpoofingDetector(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:110:     detector = VoiceSpoofingDetector(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:11: REAL_AUDIO = (
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:54: def test_real_audio_regression():
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:60:         REAL_AUDIO,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:64:     assert result["prediction"] == "REAL"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:65:     assert result["probabilities"]["real"] == pytest.approx(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:91:     assert result["probabilities"]["real"] == pytest.approx(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:121:         detector.predict(REAL_AUDIO)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:15: FAKE_AUDIO = (
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:69:     assert result["probabilities"]["fake"] == pytest.approx(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:76: def test_fake_audio_regression():
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:82:         FAKE_AUDIO,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:86:     assert result["prediction"] == "FAKE"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:87:     assert result["probabilities"]["fake"] == pytest.approx(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:21: def test_calibrated_threshold_is_loaded():
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_phase12_production_optimization.py:26:     assert detector.threshold == pytest.approx(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:22: REAL_AUDIO_ENV = os.getenv("VOICE_REAL_TEST_AUDIO")
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:25: def test_analyze_real_audio():
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:26:     """Run the detector on a known local REAL audio file when configured."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:28:     if not REAL_AUDIO_ENV:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:30:             "VOICE_REAL_TEST_AUDIO is not configured; "
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:31:             "skipping local REAL-audio integration test."
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:34:     real_audio = Path(REAL_AUDIO_ENV)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:36:     assert real_audio.exists(), f"Missing real test audio: {real_audio}"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:38:     with real_audio.open("rb") as audio:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:43:                     real_audio.name,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:55:     assert data["prediction"] in {"REAL", "FAKE"}
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:20: FAKE_AUDIO = PROJECT_ROOT / "tests" / "fixtures" / "fake_voice.flac"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:55:     assert data["prediction"] in {"REAL", "FAKE"}
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:58:     assert 0 <= data["fake_probability"] <= 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:61:         (data["original_probability"] + data["fake_probability"]) - 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:65: def test_analyze_fake_audio():
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:66:     """Known Member 5 FAKE fixture should be blocked by risk engine."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:68:     assert FAKE_AUDIO.exists(), f"Missing fake fixture: {FAKE_AUDIO}"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:70:     with FAKE_AUDIO.open("rb") as audio:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:75:                     FAKE_AUDIO.name,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:87:     assert data["prediction"] == "FAKE"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:90:     assert 0 <= data["fake_probability"] <= 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:102:     assert FAKE_AUDIO.exists(), f"Missing fake fixture: {FAKE_AUDIO}"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:108:         "fake_probability",
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:110:         "fake_percentage",
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:119:     with FAKE_AUDIO.open("rb") as audio:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:124:                     FAKE_AUDIO.name,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:57:     assert 0 <= data["original_probability"] <= 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:61:         (data["original_probability"] + data["fake_probability"]) - 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:89:     assert 0 <= data["original_probability"] <= 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:107:         "original_probability",
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:58:     assert 0 <= data["fake_probability"] <= 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:61:         (data["original_probability"] + data["fake_probability"]) - 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:90:     assert 0 <= data["fake_probability"] <= 1
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\tests\test_voice_analyze.py:108:         "fake_probability",
+
+========================================
+[10] MODEL / INFERENCE FILE INVENTORY
+========================================
+
+ai/inference/__init__.py
+ai/models/__init__.py
+backend/app/ml/inference/__init__.py
+backend/app/ml/inference/predict.py
+backend/app/ml/models/__init__.py
+backend/app/ml/models/aasist.py
+backend/app/services/deepfake_service.py
+backend/app/services/model_service.py
+
+========================================
+[11] GIT STATUS
+========================================
+
+## feature/production-optimization...origin/feature/production-optimization
+ M backend/app/api/live.py
+ M backend/app/config.py
+ M backend/app/main.py
+?? VOICEGUARD_INFERENCE_FORENSICS_REPORT.txt
+?? backend/app/api/live.py.before_ws_repair_20260909_002937
+?? backend/app/config.py.before_ws_repair_20260909_002937
+?? backend/app/main.py.before_ws_repair_20260909_002937
+?? backend/app/main.py.phase4_backup
+
+========================================
+[12] AUTOMATED DIAGNOSTIC ANALYSIS
+========================================
+
+CHECKPOINT_FOUND          : True
+REAL_FAKE_REFERENCES     : True
+BONAFIDE_SPOOF_REFERENCES: False
+SOFTMAX_PRESENT           : True
+ARGMAX_PRESENT            : False
+TRAINING_DATASET_LOGIC    : True
+
+----------------------------------------
+FORENSIC INTERPRETATION
+----------------------------------------
+INFO: REAL/FAKE or bonafide/spoof terminology exists in project inference/tests.
+
+CRITICAL CURRENT SYMPTOM:
+Genuine audio is being classified as approximately 99.9993% FAKE.
+This is too extreme to treat as a simple threshold-selection problem.
+Primary hypotheses:
+1. Class-index / label mapping mismatch.
+2. Checkpoint and AASIST architecture mismatch.
+3. Training and inference preprocessing mismatch.
+4. Probability interpretation mismatch.
+5. Incorrect checkpoint or incompatible trained weights.
+
+NO SOURCE FILES WERE MODIFIED BY THIS FORENSICS COMMAND.
+
+========================================
+ FORENSICS COMPLETE
+========================================

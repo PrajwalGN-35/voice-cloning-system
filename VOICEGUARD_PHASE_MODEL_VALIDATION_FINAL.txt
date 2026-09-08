@@ -1,0 +1,745 @@
+VOICEGUARD MODEL VALIDATION � FINAL PHASE REPORT
+=================================================
+
+Generated : 2026-09-09 00:56:12
+Branch    : feature/production-optimization
+
+OBJECTIVE
+---------
+Validate the existing anti-spoofing inference pipeline before
+making any REAL/FAKE mapping, threshold, preprocessing, or
+model changes.
+
+CURRENT OBSERVED PROBLEM
+------------------------
+Genuine microphone speech -> approximately 100% FAKE
+Genuine MP3 audio          -> approximately 99.9993% FAKE
+
+IMPORTANT
+---------
+This phase must determine the most likely inference failure
+before changing model behavior.
+
+
+=================================================
+[1] GIT BASELINE
+=================================================
+feature/production-optimization
+## feature/production-optimization...origin/feature/production-optimization
+ M backend/app/api/live.py
+ M backend/app/config.py
+ M backend/app/main.py
+?? VOICEGUARD_CLASS_MAPPING_VALIDATION.txt
+?? VOICEGUARD_INFERENCE_FORENSICS_REPORT.txt
+?? VOICEGUARD_MODEL_VALIDATION_REPORT.txt
+?? VOICEGUARD_PHASE_MODEL_VALIDATION_FINAL.txt
+?? backend/app/api/live.py.before_ws_repair_20260909_002937
+?? backend/app/config.py.before_ws_repair_20260909_002937
+?? backend/app/main.py.before_ws_repair_20260909_002937
+?? backend/app/main.py.phase4_backup
+
+=================================================
+[2] CHECKPOINT VALIDATION
+=================================================
+CHECKPOINT_STATUS: PASS
+COUNT: 1
+
+PATH: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\checkpoints\latest_calibrated.pth
+SIZE_BYTES: 9469762
+SIZE_MB: 9.03
+MODIFIED: 09/06/2026 20:34:18
+
+=================================================
+[3] CHECKPOINT LOAD TEST
+=================================================
+PATH: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\checkpoints\latest_calibrated.pth
+LOAD_STATUS: PASS
+TYPE: <class 'dict'>
+TOP_LEVEL_KEYS:
+  'epoch'
+  'model_state_dict'
+  'optimizer_state_dict'
+  'metrics'
+  'label_mapping'
+  'threshold'
+  'calibration'
+META threshold = 0.9912435405405405
+
+=================================================
+[4] INFERENCE LOGIC
+=================================================
+
+FILE: .\backend\app\ml\inference\predict.py
+LINE 15: class VoiceSpoofingDetector:
+LINE 22: threshold: Optional[float] = None,
+LINE 35: self.model = AASIST(num_classes=2)
+LINE 39: self.threshold = (
+LINE 40: float(threshold)
+LINE 41: if threshold is not None
+LINE 46: "VoiceSpoofingDetector initialized on device=%s threshold=%s",
+LINE 48: self.threshold,
+LINE 56: "Predictions are unreliable."
+LINE 60: """Load model weights and calibrated threshold from checkpoint."""
+LINE 81: if "threshold" in checkpoint:
+LINE 82: self.threshold = float(checkpoint["threshold"])
+LINE 87: if not 0.0 < self.threshold < 1.0:
+LINE 89: f"Invalid detection threshold: {self.threshold}"
+LINE 101: "Checkpoint loaded successfully path=%s threshold=%s",
+LINE 103: self.threshold,
+LINE 108: probability_real: float,
+LINE 109: probability_fake: float,
+LINE 111: """Validate the model probability output."""
+LINE 114: probability_real,
+LINE 115: probability_fake,
+LINE 129: (probability_real + probability_fake) - 1.0
+LINE 171: logits = self.model(input_tensor)
+LINE 173: if logits.ndim != 2 or logits.shape[0] != 1 or logits.shape[1] != 2:
+LINE 175: f"Unexpected model output shape: {tuple(logits.shape)}"
+LINE 178: probabilities = torch.softmax(
+LINE 179: logits,
+LINE 183: probability_real = float(
+LINE 187: probability_fake = float(
+LINE 192: probability_real,
+LINE 193: probability_fake,
+LINE 196: if probability_fake >= self.threshold:
+LINE 197: prediction = "FAKE"
+LINE 198: confidence = probability_fake * 100
+LINE 200: prediction = "REAL"
+LINE 201: confidence = probability_real * 100
+LINE 208: "prediction": prediction,
+LINE 210: "fake_score": round(
+LINE 211: probability_fake,
+LINE 215: "real": round(
+LINE 216: probability_real,
+LINE 219: "fake": round(
+LINE 220: probability_fake,
+LINE 224: "threshold": self.threshold,
+LINE 234: "real": float(
+LINE 235: logits[0][0].cpu()
+LINE 237: "fake": float(
+LINE 238: logits[0][1].cpu()
+LINE 243: "Voice inference completed prediction=%s "
+LINE 245: prediction,
+LINE 270: "prediction": "ERROR",
+LINE 284: threshold: Optional[float] = None,
+LINE 294: threshold=threshold,
+LINE 304: threshold: Optional[float] = None,
+LINE 306: """Convenience wrapper for voice spoofing prediction."""
+LINE 311: threshold=threshold,
+
+FILE: .\backend\app\services\deepfake_service.py
+LINE 15: class DeepfakeDetectionService:
+LINE 24: """Analyze an audio file and return model prediction."""
+LINE 31: "prediction": result["prediction"],
+LINE 33: "original_probability": result["probabilities"]["real"],
+LINE 34: "fake_probability": result["probabilities"]["fake"],
+LINE 35: "threshold": result["threshold"],
+LINE 43: def get_deepfake_service() -> DeepfakeDetectionService:
+LINE 48: _detector_service = DeepfakeDetectionService()
+
+FILE: .\backend\app\services\model_service.py
+LINE 5: class ModelService:
+
+=================================================
+[5] PREPROCESSING VALIDATION
+=================================================
+"""
+Audio Preprocessing Pipeline for Voice Spoofing Detection
+
+This module provides reusable functions for audio preprocessing,
+designed to work with AASIST and other voice spoofing detection models.
+"""
+
+import numpy as np
+import librosa
+import soundfile as sf
+from typing import Union, Tuple
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class AudioPreprocessor:
+    """
+    Handles audio loading, preprocessing, and feature extraction for voice spoofing detection.
+    
+    Attributes:
+        sample_rate (int): Target sample rate (default: 16000 Hz)
+        n_mels (int): Number of mel-frequency bins (default: 128)
+        n_fft (int): FFT size (default: 512)
+        hop_length (int): Number of samples between successive frames (default: 160)
+    """
+    
+    def __init__(self, sample_rate: int = 16000, n_mels: int = 128, 
+                 n_fft: int = 512, hop_length: int = 160, 
+                 duration: float = 5.0):
+        """
+        Initialize audio preprocessor.
+        
+        Args:
+            sample_rate (int): Target sample rate in Hz
+            n_mels (int): Number of mel-frequency bins
+            n_fft (int): FFT window size
+            hop_length (int): Hop length for STFT
+            duration (float): Audio duration in seconds (for padding/truncation)
+        """
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.duration = duration
+        self.max_samples = int(sample_rate * duration)
+    
+    def load_audio(self, audio_path: str) -> np.ndarray:
+        """
+        Load audio file and resample to target sample rate.
+        
+        Args:
+            audio_path (str): Path to audio file (WAV, FLAC, MP3, etc.)
+            
+        Returns:
+            np.ndarray: Audio waveform (mono, normalized to [-1, 1])
+            
+        Raises:
+            FileNotFoundError: If audio file doesn't exist
+            RuntimeError: If audio file cannot be loaded
+        """
+        try:
+            # Load audio and resample to target sample rate
+            audio, sr = librosa.load(audio_path, sr=self.sample_rate, mono=True)
+            logger.info(f"✓ Loaded audio: {audio_path} (duration: {len(audio)/self.sample_rate:.2f}s)")
+            return audio
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load audio: {str(e)}")
+    
+    def normalize_audio(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Normalize audio to [-1, 1] range.
+        
+        Args:
+            audio (np.ndarray): Audio waveform
+            
+        Returns:
+            np.ndarray: Normalized audio
+        """
+        # Remove any DC offset
+        audio = audio - np.mean(audio)
+        
+        # Normalize by peak amplitude
+        max_val = np.max(np.abs(audio))
+        if max_val > 0:
+            audio = audio / max_val
+        
+        return audio
+    
+    def pad_or_truncate(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Pad or truncate audio to fixed duration.
+        
+        Args:
+            audio (np.ndarray): Audio waveform
+            
+        Returns:
+            np.ndarray: Audio padded/truncated to fixed length
+        """
+        if len(audio) < self.max_samples:
+            # Pad with zeros
+            pad_amount = self.max_samples - len(audio)
+            audio = np.pad(audio, (0, pad_amount), mode='constant', constant_values=0)
+            logger.info(f"✓ Padded audio to {len(audio)} samples")
+        else:
+            # Truncate
+            audio = audio[:self.max_samples]
+            logger.info(f"✓ Truncated audio to {len(audio)} samples")
+        
+        return audio
+    
+    def extract_mel_spectrogram(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Extract mel-spectrogram from audio waveform.
+        
+        Args:
+            audio (np.ndarray): Audio waveform
+            
+        Returns:
+            np.ndarray: Mel-spectrogram (n_mels, time_steps)
+        """
+        # Compute mel-spectrogram
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio,
+            sr=self.sample_rate,
+            n_mels=self.n_mels,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length
+        )
+        
+        # Convert to log scale (in dB)
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        
+        logger.info(f"✓ Extracted mel-spectrogram: {mel_spec_db.shape}")
+        return mel_spec_db
+    
+    def preprocess(self, audio_path: str, verbose: bool = True) -> Tuple[np.ndarray, dict]:
+        """
+        Complete preprocessing pipeline: load → normalize → pad/truncate → extract mel-spec.
+        
+        Args:
+            audio_path (str): Path to audio file
+            verbose (bool): Print progress messages
+            
+        Returns:
+            Tuple containing:
+                - np.ndarray: Processed mel-spectrogram (128, ~157)
+                - dict: Metadata with original duration, sample rate, shape
+        """
+        # Load and normalize
+        audio = self.load_audio(audio_path)
+        audio = self.normalize_audio(audio)
+        
+        # Pad/truncate
+        audio = self.pad_or_truncate(audio)
+        
+        # Extract mel-spectrogram
+        mel_spec = self.extract_mel_spectrogram(audio)
+        
+        # Collect metadata
+        metadata = {
+            'original_duration': len(audio) / self.sample_rate,
+            'sample_rate': self.sample_rate,
+            'mel_spec_shape': mel_spec.shape,
+            'n_mels': self.n_mels,
+            'audio_path': audio_path
+        }
+        
+        if verbose:
+            logger.info(f"✓ Preprocessing complete!\n  Shape: {mel_spec.shape}\n  Duration: {metadata['original_duration']:.2f}s")
+        
+        return mel_spec, metadata
+
+
+def preprocess_audio_file(audio_path: str, sample_rate: int = 16000, 
+                         duration: float = 5.0) -> Tuple[np.ndarray, dict]:
+    """
+    Standalone function to preprocess a single audio file.
+    
+    Args:
+        audio_path (str): Path to audio file
+        sample_rate (int): Target sample rate
+        duration (float): Target duration in seconds
+        
+    Returns:
+        Tuple of (mel_spectrogram, metadata_dict)
+    """
+    preprocessor = AudioPreprocessor(sample_rate=sample_rate, duration=duration)
+    return preprocessor.preprocess(audio_path)
+
+=================================================
+[6] AASIST ARCHITECTURE
+=================================================
+"""
+AASIST Model Architecture for Voice Spoofing Detection
+
+Simplified implementation of Audio Anti-Spoofing using Integrated 
+Spectro-Temporal Graph Attention Networks.
+
+Reference: Li et al., "AASIST: Audio Anti-Spoofing using Integrated 
+Spectro-Temporal Graph Attention Networks", ICASSP 2022
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class ConvBlock(nn.Module):
+    """Convolutional block: Conv → BatchNorm → ReLU → Dropout"""
+    
+    def __init__(self, in_channels, out_channels, kernel_size, padding=1, dropout=0.2):
+        super(ConvBlock, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        return x
+
+
+class ResidualBlock(nn.Module):
+    """Residual block with skip connection"""
+    
+    def __init__(self, channels, dropout=0.2):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = ConvBlock(channels, channels, (3, 3), padding=1, dropout=dropout)
+        self.conv2 = ConvBlock(channels, channels, (3, 3), padding=1, dropout=dropout)
+    
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + residual
+        return out
+
+
+class SelfAttention(nn.Module):
+    """Multi-head self-attention module"""
+    
+    def __init__(self, channels, num_heads=8):
+        super(SelfAttention, self).__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        
+        assert channels % num_heads == 0, "channels must be divisible by num_heads"
+        
+        self.head_dim = channels // num_heads
+        
+        self.query = nn.Linear(channels, channels)
+        self.key = nn.Linear(channels, channels)
+        self.value = nn.Linear(channels, channels)
+        self.fc_out = nn.Linear(channels, channels)
+    
+    def forward(self, x):
+        # x: (batch, channels, height, width)
+        batch, channels, height, width = x.shape
+        
+        # Flatten spatial dimensions
+        x_flat = x.view(batch, channels, -1).transpose(1, 2)  # (batch, HW, channels)
+        
+        # Linear projections
+        Q = self.query(x_flat)
+        K = self.key(x_flat)
+        V = self.value(x_flat)
+        
+        # Split into multiple heads
+        Q = Q.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attention = F.softmax(scores, dim=-1)
+        
+        # Attention output
+        out = torch.matmul(attention, V)
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(batch, -1, channels)
+        
+        # Final linear layer
+        out = self.fc_out(out)
+        
+        # Reshape back to spatial format
+        out = out.transpose(1, 2).view(batch, channels, height, width)
+        
+        return out
+
+
+class AASIST(nn.Module):
+    """
+    AASIST Model for Voice Spoofing Detection
+    
+    Architecture:
+    1. Convolutional frontend (multi-scale feature extraction)
+    2. Residual blocks (deep feature learning)
+    3. Self-attention (spectro-temporal modeling)
+    4. Global average pooling
+    5. Classification head
+    """
+    
+    def __init__(self, num_classes=2, dropout=0.2, num_heads=8):
+        super(AASIST, self).__init__()
+        
+        self.num_classes = num_classes
+        
+        # Convolutional Frontend
+        # Input: (batch, 1, 128, time_steps)
+        self.conv1 = ConvBlock(1, 32, (3, 3), padding=1, dropout=dropout)  # (batch, 32, 128, time_steps)
+        self.pool1 = nn.MaxPool2d((2, 2))  # (batch, 32, 64, time_steps/2)
+        
+        self.conv2 = ConvBlock(32, 64, (3, 3), padding=1, dropout=dropout)  # (batch, 64, 64, time_steps/2)
+        self.pool2 = nn.MaxPool2d((2, 2))  # (batch, 64, 32, time_steps/4)
+        
+        self.conv3 = ConvBlock(64, 128, (3, 3), padding=1, dropout=dropout)  # (batch, 128, 32, time_steps/4)
+        self.pool3 = nn.MaxPool2d((2, 2))  # (batch, 128, 16, time_steps/8)
+        
+        # Residual Blocks
+        self.res_block1 = ResidualBlock(128, dropout=dropout)
+        self.res_block2 = ResidualBlock(128, dropout=dropout)
+        
+        # Self-Attention Layer
+        self.attention = SelfAttention(128, num_heads=num_heads)
+        
+        # Global Average Pooling
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Classification Head
+        self.fc1 = nn.Linear(128, 256)
+        self.dropout_fc = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(256, num_classes)
+    
+    def forward(self, x):
+        """
+        Forward pass
+        
+        Args:
+            x: Input tensor of shape (batch, 1, 128, time_steps)
+               where 128 is number of mel-frequency bins
+               
+        Returns:
+            logits: Tensor of shape (batch, num_classes)
+        """
+        # Convolutional frontend
+        x = self.conv1(x)
+        x = self.pool1(x)
+        
+        x = self.conv2(x)
+        x = self.pool2(x)
+        
+        x = self.conv3(x)
+        x = self.pool3(x)
+        
+        # Residual blocks
+        x = self.res_block1(x)
+        x = self.res_block2(x)
+        
+        # Self-attention
+        x = self.attention(x)
+        
+        # Global average pooling
+        x = self.global_pool(x)
+        x = x.view(x.size(0), -1)  # Flatten
+        
+        # Classification head
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout_fc(x)
+        logits = self.fc2(x)
+        
+        return logits
+
+
+class LossFunction(nn.Module):
+    """Combined loss function for voice spoofing detection"""
+    
+    def __init__(self, loss_type='cross_entropy'):
+        super(LossFunction, self).__init__()
+        self.loss_type = loss_type
+        
+        if loss_type == 'cross_entropy':
+            self.loss_fn = nn.CrossEntropyLoss()
+        elif loss_type == 'focal':
+            self.loss_fn = FocalLoss()
+        else:
+            raise ValueError(f"Unknown loss type: {loss_type}")
+    
+    def forward(self, logits, labels):
+        return self.loss_fn(logits, labels)
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for imbalanced classification"""
+    
+    def __init__(self, alpha=1.0, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+    
+    def forward(self, logits, labels):
+        ce_loss = F.cross_entropy(logits, labels, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
+
+
+if __name__ == "__main__":
+    print("\n" + "="*70)
+    print("AASIST Model Test")
+    print("="*70)
+    
+    # Create model
+    model = AASIST(num_classes=2)
+    print(f"\n✓ Model created successfully!")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Test forward pass
+    batch_size = 4
+    x = torch.randn(batch_size, 1, 128, 501)  # (batch, channels, mel_bins, time_steps)
+    
+    print(f"\n📍 Testing forward pass...")
+    print(f"  Input shape: {x.shape}")
+    
+    logits = model(x)
+    print(f"  Output shape: {logits.shape}")
+    print(f"  Expected shape: ({batch_size}, 2)")
+    
+    # Test loss calculation
+    labels = torch.LongTensor([0, 1, 0, 1])
+    loss_fn = LossFunction(loss_type='cross_entropy')
+    loss = loss_fn(logits, labels)
+    
+    print(f"\n✓ Loss calculation successful!")
+    print(f"  Loss value: {loss.item():.4f}")
+    
+    # Test backward pass
+    loss.backward()
+    print(f"\n✓ Backward pass successful!")
+    
+    print(f"\n✅ AASIST model test PASSED!")
+
+=================================================
+[7] AVAILABLE AUDIO SANITY TEST
+=================================================
+AUDIO_STATUS: FOUND
+COUNT: 100
+INFO:backend.app.ml.inference.predict:VoiceSpoofingDetector initialized on device=cpu threshold=0.5
+INFO:backend.app.ml.inference.predict:Checkpoint loaded successfully path=C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\checkpoints\latest_calibrated.pth threshold=0.9912435405405405
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Loaded audio: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\1cb37204fcf04d629c2cd0604b77acee.wav (duration: 121.00s)
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Truncated audio to 80000 samples
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Extracted mel-spectrogram: (128, 501)
+INFO:backend.app.ml.inference.predict:Voice inference completed prediction=FAKE confidence=99.88 inference_time_ms=2281.92
+AUDIO: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\1cb37204fcf04d629c2cd0604b77acee.wav
+ANALYSIS_STATUS: PASS
+PREDICTION: FAKE
+CONFIDENCE: 99.88
+REAL_PROBABILITY: 0.00117
+FAKE_PROBABILITY: 0.99883
+THRESHOLD: 0.9912435405405405
+RAW_SCORES: {'real': -3.1923041343688965, 'fake': 3.5571653842926025}
+INFO:backend.app.ml.inference.predict:VoiceSpoofingDetector initialized on device=cpu threshold=0.5
+INFO:backend.app.ml.inference.predict:Checkpoint loaded successfully path=C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\checkpoints\latest_calibrated.pth threshold=0.9912435405405405
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Loaded audio: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\uploads\51e1a74bdf864315ad82b015678ec817.wav (duration: 18.69s)
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Truncated audio to 80000 samples
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Extracted mel-spectrogram: (128, 501)
+INFO:backend.app.ml.inference.predict:Voice inference completed prediction=REAL confidence=65.35 inference_time_ms=2242.95
+AUDIO: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\uploads\51e1a74bdf864315ad82b015678ec817.wav
+ANALYSIS_STATUS: PASS
+PREDICTION: REAL
+CONFIDENCE: 65.35
+REAL_PROBABILITY: 0.653503
+FAKE_PROBABILITY: 0.346497
+THRESHOLD: 0.9912435405405405
+RAW_SCORES: {'real': 0.27004489302635193, 'fake': -0.36442989110946655}
+INFO:backend.app.ml.inference.predict:VoiceSpoofingDetector initialized on device=cpu threshold=0.5
+INFO:backend.app.ml.inference.predict:Checkpoint loaded successfully path=C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\checkpoints\latest_calibrated.pth threshold=0.9912435405405405
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Loaded audio: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\7c702a0733924dcc8f273c7d0a1915ee.wav (duration: 18.69s)
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Truncated audio to 80000 samples
+INFO:backend.app.ml.preprocessing.audio_preprocessing:\u2713 Extracted mel-spectrogram: (128, 501)
+INFO:backend.app.ml.inference.predict:Voice inference completed prediction=REAL confidence=65.35 inference_time_ms=2165.79
+AUDIO: C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\7c702a0733924dcc8f273c7d0a1915ee.wav
+ANALYSIS_STATUS: PASS
+PREDICTION: REAL
+CONFIDENCE: 65.35
+REAL_PROBABILITY: 0.653503
+FAKE_PROBABILITY: 0.346497
+THRESHOLD: 0.9912435405405405
+RAW_SCORES: {'real': 0.27004489302635193, 'fake': -0.36442989110946655}
+
+=================================================
+[8] AUTOMATED TESTS
+=================================================
+TEST: test_voice_analyze.py
+s...                                                                     [100%]
+============================== warnings summary ===============================
+.venv\Lib\site-packages\fastapi\testclient.py:1
+  C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\.venv\Lib\site-packages\fastapi\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+.venv\Lib\site-packages\starlette\testclient.py:53
+  C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\.venv\Lib\site-packages\starlette\testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+3 passed, 1 skipped, 2 warnings in 12.26s
+
+TEST: test_phase12_production_optimization.py
+........                                                                 [100%]
+8 passed in 5.36s
+
+=================================================
+[9] CLASS MAPPING EVIDENCE
+=================================================
+0_REAL_EVIDENCE: False
+1_FAKE_EVIDENCE: False
+0_FAKE_EVIDENCE: True
+1_REAL_EVIDENCE: False
+
+CLASS_MAPPING_RESULT: NOT_DEFINITIVE
+
+=================================================
+[10] PROBABILITY EXTRACTION
+=================================================
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:56: "Predictions are unreliable."
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:107: def _validate_probabilities(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:120: "Model produced non-finite probabilities."
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:125: "Model produced probabilities outside [0, 1]."
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:132: "Model probabilities do not sum to 1."
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:171: logits = self.model(input_tensor)
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:173: if logits.ndim != 2 or logits.shape[0] != 1 or logits.shape[1] != 2:
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:175: f"Unexpected model output shape: {tuple(logits.shape)}"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:178: probabilities = torch.softmax(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:179: logits,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:184: probabilities[0].cpu()
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:188: probabilities[1].cpu()
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:191: self._validate_probabilities(
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:197: prediction = "FAKE"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:200: prediction = "REAL"
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:208: "prediction": prediction,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:214: "probabilities": {
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:233: result["raw_scores"] = {
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:235: logits[0][0].cpu()
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:238: logits[0][1].cpu()
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:243: "Voice inference completed prediction=%s "
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:245: prediction,
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:270: "prediction": "ERROR",
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\ml\inference\predict.py:306: """Convenience wrapper for voice spoofing prediction."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:24: """Analyze an audio file and return model prediction."""
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:31: "prediction": result["prediction"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:33: "original_probability": result["probabilities"]["real"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:34: "fake_probability": result["probabilities"]["fake"],
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\backend\app\services\deepfake_service.py:36: "raw_scores": result.get("raw_scores"),
+
+=================================================
+[11] FINAL PHASE DECISION
+=================================================
+
+========================================
+FINAL_VERDICT: VALIDATION_COMPLETE
+========================================
+
+Action: Model validation evidence is internally consistent.
+
+=================================================
+[12] PHASE ARTIFACTS
+=================================================
+Primary report:
+.\VOICEGUARD_PHASE_MODEL_VALIDATION_FINAL.txt
+
+Previous forensic report:
+.\VOICEGUARD_INFERENCE_FORENSICS_REPORT.txt
+
+Previous validation report:
+.\VOICEGUARD_MODEL_VALIDATION_REPORT.txt
+
+=================================================
+[13] FINAL GIT STATUS
+=================================================
+## feature/production-optimization...origin/feature/production-optimization
+ M backend/app/api/live.py
+ M backend/app/config.py
+ M backend/app/main.py
+?? VOICEGUARD_CLASS_MAPPING_VALIDATION.txt
+?? VOICEGUARD_INFERENCE_FORENSICS_REPORT.txt
+?? VOICEGUARD_MODEL_VALIDATION_REPORT.txt
+?? VOICEGUARD_PHASE_MODEL_VALIDATION_FINAL.txt
+?? backend/app/api/live.py.before_ws_repair_20260909_002937
+?? backend/app/config.py.before_ws_repair_20260909_002937
+?? backend/app/main.py.before_ws_repair_20260909_002937
+?? backend/app/main.py.phase4_backup
