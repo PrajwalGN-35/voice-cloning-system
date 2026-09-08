@@ -1,14 +1,14 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import logging
 import subprocess
 import time
+from collections import deque
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 
 from backend.app.config import settings
 from backend.app.security import require_api_key
@@ -25,6 +25,7 @@ router = APIRouter(prefix="/api/v1/live", tags=["live"])
 
 MAX_CHUNK_BYTES = 8 * 1024 * 1024
 LIVE_WINDOW_SECONDS = 5
+MAX_BUFFER_BYTES = 40 * 1024 * 1024
 
 audio_quality_service = AudioQualityService()
 
@@ -59,25 +60,31 @@ def live_status():
         "transport": "websocket",
         "window_seconds": LIVE_WINDOW_SECONDS,
         "analysis": "AASIST + reliability + adaptive risk",
+        "windowing": "rolling",
     }
 
 
-def _process_live_chunk(binary_data: bytes, connection_id: str) -> dict:
+def _process_live_window(
+    binary_data: bytes,
+    connection_id: str,
+    sequence_number: int,
+) -> dict:
     """
-    Convert one browser MediaRecorder segment into 16 kHz mono WAV,
-    then run the existing VoiceGuard detection, reliability, and
-    adaptive-risk pipeline.
+    Analyse one complete rolling live-audio window.
+
+    Browser MediaRecorder data may be WebM/Opus or another supported
+    container. FFmpeg converts the window to 16 kHz mono PCM WAV before
+    sending it through the existing VoiceGuard detection pipeline.
     """
 
     started = time.perf_counter()
-    chunk_id = uuid4().hex
+    window_id = uuid4().hex
 
-    input_path = settings.processed_dir / f"live_{chunk_id}.webm"
-    wav_path = settings.processed_dir / f"live_{chunk_id}.wav"
+    input_path = settings.processed_dir / f"live_window_{window_id}.webm"
+    wav_path = settings.processed_dir / f"live_window_{window_id}.wav"
 
     try:
         settings.processed_dir.mkdir(parents=True, exist_ok=True)
-
         input_path.write_bytes(binary_data)
 
         ffmpeg = find_ffmpeg()
@@ -117,7 +124,6 @@ def _process_live_chunk(binary_data: bytes, connection_id: str) -> dict:
         detector = get_deepfake_service()
 
         detection = detector.analyze(str(wav_path))
-
         quality = audio_quality_service.analyze(str(wav_path))
 
         risk = assess_adaptive_risk(
@@ -135,7 +141,8 @@ def _process_live_chunk(binary_data: bytes, connection_id: str) -> dict:
         return {
             "type": "ANALYSIS_RESULT",
             "connection_id": connection_id,
-            "chunk_id": chunk_id,
+            "window_id": window_id,
+            "sequence_number": sequence_number,
             "window_seconds": LIVE_WINDOW_SECONDS,
             "processing_ms": elapsed_ms,
             "detection": {
@@ -189,6 +196,7 @@ async def live_websocket(websocket: WebSocket):
             "type": "CONNECTED",
             "connection_id": connection_id,
             "window_seconds": LIVE_WINDOW_SECONDS,
+            "windowing": "rolling",
             "message": "Live audio stream connected.",
         },
     )
@@ -197,6 +205,11 @@ async def live_websocket(websocket: WebSocket):
         "Live websocket connected connection_id=%s",
         connection_id,
     )
+
+    audio_buffer: deque[bytes] = deque()
+    buffered_bytes = 0
+    sequence_number = 0
+    analysis_in_progress = False
 
     try:
         while True:
@@ -221,7 +234,7 @@ async def live_websocket(websocket: WebSocket):
 
                 continue
 
-            if len(binary_data) == 0:
+            if not binary_data:
                 continue
 
             if len(binary_data) > MAX_CHUNK_BYTES:
@@ -246,22 +259,68 @@ async def live_websocket(websocket: WebSocket):
                 )
                 break
 
+            audio_buffer.append(binary_data)
+            buffered_bytes += len(binary_data)
+
+            while buffered_bytes > MAX_BUFFER_BYTES and audio_buffer:
+                removed = audio_buffer.popleft()
+                buffered_bytes -= len(removed)
+
             await _send_json(
                 websocket,
                 {
                     "type": "CHUNK_RECEIVED",
                     "connection_id": connection_id,
                     "bytes": len(binary_data),
+                    "buffered_bytes": buffered_bytes,
                 },
             )
+
+            # The frontend sends approximately one second per chunk.
+            # Five chunks therefore form one analysis window.
+            if len(audio_buffer) < LIVE_WINDOW_SECONDS:
+                continue
+
+            if analysis_in_progress:
+                continue
+
+            window_chunks = list(audio_buffer)
+
+            # Consume one rolling window while retaining the newest
+            # portion for the next window.
+            #
+            # Removing one chunk creates a 4-second overlap between
+            # consecutive 5-second windows when chunks are ~1 second.
+            oldest = audio_buffer.popleft()
+            buffered_bytes -= len(oldest)
+
+            window_data = b"".join(window_chunks)
+
+            if not window_data:
+                continue
+
+            sequence_number += 1
+            analysis_in_progress = True
 
             analysis_started = time.perf_counter()
 
             try:
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "WINDOW_READY",
+                        "connection_id": connection_id,
+                        "sequence_number": sequence_number,
+                        "window_seconds": LIVE_WINDOW_SECONDS,
+                        "buffered_bytes": buffered_bytes,
+                    },
+                )
+
                 result = await asyncio.to_thread(
-                    _process_live_chunk,
-                    binary_data,
+                    _process_live_window,
+                    window_data,
                     connection_id,
+                    sequence_number,
                 )
 
                 result["transport_processing_ms"] = round(
@@ -272,10 +331,11 @@ async def live_websocket(websocket: WebSocket):
                 await _send_json(websocket, result)
 
                 logger.info(
-                    "Live analysis completed connection_id=%s "
-                    "prediction=%s confidence=%.2f action=%s "
-                    "processing_ms=%.1f",
+                    "Live rolling analysis completed "
+                    "connection_id=%s sequence=%s prediction=%s "
+                    "confidence=%.2f action=%s processing_ms=%.1f",
                     connection_id,
+                    sequence_number,
                     result["detection"]["prediction"],
                     result["detection"]["confidence"],
                     result["risk"]["action"],
@@ -284,8 +344,10 @@ async def live_websocket(websocket: WebSocket):
 
             except Exception as exc:
                 logger.exception(
-                    "Live chunk analysis failed connection_id=%s",
+                    "Live rolling window analysis failed "
+                    "connection_id=%s sequence=%s",
                     connection_id,
+                    sequence_number,
                 )
 
                 await _send_json(
@@ -293,6 +355,7 @@ async def live_websocket(websocket: WebSocket):
                     {
                         "type": "ANALYSIS_ERROR",
                         "connection_id": connection_id,
+                        "sequence_number": sequence_number,
                         "message": (
                             "Live audio analysis failed for this "
                             "window. The stream remains active."
@@ -300,6 +363,9 @@ async def live_websocket(websocket: WebSocket):
                         "detail": str(exc)[:500],
                     },
                 )
+
+            finally:
+                analysis_in_progress = False
 
     except WebSocketDisconnect:
         logger.info(
