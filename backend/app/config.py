@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     generated_dir: Path = Path("data/generated")
     model_dir: Path = Path("models")
 
-    frontend_origins: str = "http://localhost:3000,http://localhost:5173"
+    frontend_origins: str = "http://localhost:3000,http://localhost:3002,http://localhost:5173"
 
     api_key: str = Field(
         default="",
@@ -39,3 +39,4 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
