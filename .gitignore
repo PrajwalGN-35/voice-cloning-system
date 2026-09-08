@@ -24,3 +24,12 @@ test_audio.wav
 
 # Keep committed integration-test fixture
 !tests/fixtures/fake_voice.flac
+
+# Local debugging backups
+*.bak
+*.before-*
+.phase8_backup_*/
+.phase8_final_backup_*/
+_SELF_HEAL_*/
+
+*.before_pcm_*

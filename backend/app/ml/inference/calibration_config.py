@@ -1,0 +1,5 @@
+# Auto-generated from controlled VoiceGuard calibration.\n'
+f'# Created: 2026-09-09T03:42:51.683452\n'
+f'CALIBRATED_FAKE_THRESHOLD = 0.999355767\n'
+f'CALIBRATION_REAL_MAX = 0.999341\n'
+f'CALIBRATION_FAKE_MIN = 0.999998\n'
