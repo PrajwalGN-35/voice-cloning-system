@@ -132,7 +132,7 @@ async def apply_security_headers(request: Request, call_next):
 
 app.add_exception_handler(AppError, app_error_handler)
 
-app.router.routes.extend(live_router.routes)
+app.include_router(live_router)
 
 
 app.add_middleware(
@@ -143,8 +143,12 @@ app.add_middleware(
         if origin.strip()
     ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Content-Type",
+        "X-API-Key",
+        "X-Request-ID",
+    ],
 )
 
 
@@ -370,7 +374,6 @@ async def clone_voice(
 
         if processed_file:
             audio_service.cleanup_processed_file(processed_file)
-
 
 
 
