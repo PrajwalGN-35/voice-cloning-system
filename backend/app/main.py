@@ -27,6 +27,7 @@ from backend.app.services.model_service import model_service
 from backend.app.services.voice_service import voice_service
 from backend.app.services.deepfake_service import get_deepfake_service
 from backend.app.services.audio_quality_service import AudioQualityService
+from backend.app.api.live import router as live_router
 from backend.app.security.adaptive_risk_service import assess_adaptive_risk
 
 from backend.app.utils.paths import initialize_directories
@@ -130,6 +131,8 @@ async def apply_security_headers(request: Request, call_next):
 
 
 app.add_exception_handler(AppError, app_error_handler)
+
+app.include_router(live_router)
 
 
 app.add_middleware(
@@ -371,5 +374,6 @@ async def clone_voice(
 
         if processed_file:
             audio_service.cleanup_processed_file(processed_file)
+
 
 
