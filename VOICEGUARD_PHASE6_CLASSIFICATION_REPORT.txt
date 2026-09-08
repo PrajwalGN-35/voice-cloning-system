@@ -1,0 +1,53 @@
+VOICEGUARD PHASE 6 CLASSIFICATION ACCURACY REPORT
+================================================
+DATE: 09/09/2026 01:04:35
+
+
+--- INFERENCE MAPPING ---
+class VoiceSpoofingDetector:
+    """Production inference service for the calibrated voice spoofing model."""
+            "VoiceSpoofingDetector initialized on device=%s threshold=%s",
+                "Predictions are unreliable."
+        probability_real: float,
+        probability_fake: float,
+        """Validate the model probability output."""
+            probability_real,
+            probability_fake,
+            (probability_real + probability_fake) - 1.0
+        """Run calibrated voice spoofing inference."""
+        probabilities = torch.softmax(
+        probability_real = float(
+        probability_fake = float(
+            probability_real,
+            probability_fake,
+        if probability_fake >= self.threshold:
+            prediction = "FAKE"
+            confidence = probability_fake * 100
+            prediction = "REAL"
+            confidence = probability_real * 100
+            "prediction": prediction,
+            "fake_score": round(
+                probability_fake,
+                "real": round(
+                    probability_real,
+                "fake": round(
+                    probability_fake,
+                "real": float(
+                "fake": float(
+            "Voice inference completed prediction=%s "
+            prediction,
+                        "prediction": "ERROR",
+        _detector_instance = VoiceSpoofingDetector(
+    """Convenience wrapper for voice spoofing prediction."""
+
+--- AUDIO SAMPLES ---
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\generated\generated_7c702a0733924dcc8f273c7d0a1915ee.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\generated\generated_9670fffa46d04c25bd8caa8c62f6df8b.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\generated\generated_f0f1bbc09cb642e787608806a63a1575.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\0500cf3060e141988ca7c34f262fbde4.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\06cdc85cae2c493ea4f21cd524e8a233.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\075fe91c658a496b8546335d86cc481e.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\0a730056af204b97b352df1223274407.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\1b4cb84ee90840c78800540b5a9f4163.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\1b59c5edb4df4e699d21e27a85f2abb4.wav
+C:\Users\Prajwal G N\OneDrive\Documents\Desktop\voice-cloning-system\data\processed\1b9f72c430794dd98e0998d242ad31be.wav
